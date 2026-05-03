@@ -17,12 +17,17 @@
 #include <dxgi.h>
 #include <d3dcompiler.h>
 
+#include <opus/opus.h>
+#include <xaudio2.h>
+
+
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_d3d11va.h>
 }
 
+#pragma comment(lib, "xaudio2.lib")
 #pragma comment(lib, "d3dcompiler.lib")
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -170,6 +175,9 @@ static HWND CreateClientWindow() {
     wc.lpfnWndProc = DefWindowProc;
     wc.hInstance = GetModuleHandle(NULL);
     wc.lpszClassName = L"GameStreamClient";
+
+    wc.hCursor = NULL;
+
     RegisterClass(&wc);
 
     // Get the physical monitor dimensions of the Client PC
@@ -195,6 +203,12 @@ int main() {
 
     WSADATA wsaData;
     WSAStartup(MAKEWORD(2, 2), &wsaData);
+
+    SOCKET inputSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    sockaddr_in hostInputAddr = { 0 };
+    hostInputAddr.sin_family = AF_INET;
+    hostInputAddr.sin_port = htons(9999);
+    inet_pton(AF_INET, "192.168.1.17", &hostInputAddr.sin_addr);
 
     SOCKET recvSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     sockaddr_in recvAddr = { 0 };
@@ -382,116 +396,268 @@ int main() {
     double clientLatencyMs = 0.0;
     // ---------------------------------
 
+    // =========================================================================
+    // AUDIO SETUP: XAudio2 + Opus
+    // =========================================================================
+    CoInitializeEx(NULL, COINIT_MULTITHREADED);
+
+    IXAudio2* pXAudio2 = nullptr;
+    XAudio2Create(&pXAudio2, 0, XAUDIO2_DEFAULT_PROCESSOR);
+
+    IXAudio2MasteringVoice* pMasterVoice = nullptr;
+    pXAudio2->CreateMasteringVoice(&pMasterVoice);
+
+    // We know the Host is sending 48000 Hz, 2 Channel, 32-bit Float audio
+    WAVEFORMATEX wfx = { 0 };
+    wfx.wFormatTag = WAVE_FORMAT_IEEE_FLOAT;
+    wfx.nChannels = 2;
+    wfx.nSamplesPerSec = 48000;
+    wfx.wBitsPerSample = 32;
+    wfx.nBlockAlign = (wfx.nChannels * wfx.wBitsPerSample) / 8;
+    wfx.nAvgBytesPerSec = wfx.nSamplesPerSec * wfx.nBlockAlign;
+
+    IXAudio2SourceVoice* pSourceVoice = nullptr;
+    pXAudio2->CreateSourceVoice(&pSourceVoice, &wfx);
+    pSourceVoice->Start(0);
+
+    int opusErr;
+    OpusDecoder* opusDec = opus_decoder_create(48000, 2, &opusErr);
+    std::cout << "[AUDIO] XAudio2 & Opus Decoder Ready.\n";
+
+    ShowCursor(TRUE);
+
+    // XAudio2 reads memory asynchronously. We need a "Ring Buffer" to hold the 
+    // decoded audio safely while the sound card plays it, otherwise it gets overwritten!
+    const int AUDIO_BUFFERS = 32;
+    std::vector<std::vector<float>> audioRing(AUDIO_BUFFERS, std::vector<float>(960 * 2));
+    int ringIdx = 0;
+    // =========================================================================
+
+    
+
+    bool isGameMode = false;
+    std::cout << "\n=================================================\n";
+    std::cout << "  HOTKEY: Press [ F8 ] to Toggle Game Mode\n";
+    std::cout << "=================================================\n\n";
+
     while (running) {
         MSG msg;
         while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
-            if (msg.message == WM_QUIT) running = false;
-            if (msg.message == WM_KEYDOWN && msg.wParam == 'D') {
-                useDebugShader = !useDebugShader;
-                g_pContext->PSSetShader(useDebugShader ? pPSDbg : g_pPS, 0, 0);
-                std::cout << "[DIAG] Switched to " << (useDebugShader ? "GRAYSCALE debug" : "FULL COLOUR YUV") << " shader\n";
+
+            // --- TOGGLE HOTKEY (F8) ---
+            if ((msg.message == WM_KEYDOWN || msg.message == WM_SYSKEYDOWN) && msg.wParam == VK_F8) {
+                if ((msg.lParam & (1 << 30)) == 0) { // Prevent holding down auto-repeat
+                    isGameMode = !isGameMode;
+                    if (isGameMode) {
+                        // Lock cursor perfectly to the Client window
+                        RECT rect;
+                        GetClientRect(hWnd, &rect);
+                        POINT ptTopLeft = { rect.left, rect.top };
+                        POINT ptBottomRight = { rect.right, rect.bottom };
+                        ClientToScreen(hWnd, &ptTopLeft);
+                        ClientToScreen(hWnd, &ptBottomRight);
+                        rect.left = ptTopLeft.x; rect.top = ptTopLeft.y;
+                        rect.right = ptBottomRight.x; rect.bottom = ptBottomRight.y;
+                        ClipCursor(&rect);
+
+                        // Snap cursor to dead center to begin
+                        POINT center = { clientW / 2, clientH / 2 };
+                        ClientToScreen(hWnd, &center);
+                        SetCursorPos(center.x, center.y);
+
+                        std::cout << "[INPUT] GAME MODE ON - 3D Camera Locked.\n";
+                    }
+                    else {
+                        ShowCursor(TRUE); // Bring cursor back
+                        ClipCursor(NULL);
+                        std::cout << "[INPUT] DESKTOP MODE ON - Mouse Unlocked.\n";
+                    }
+                }
+                continue; // Do NOT send F8 to the Host PC
             }
-            TranslateMessage(&msg); DispatchMessage(&msg);
+
+            // --- MOUSE CLICKS (Always Active) ---
+            else if (msg.message == WM_LBUTTONDOWN || msg.message == WM_LBUTTONUP ||
+                msg.message == WM_RBUTTONDOWN || msg.message == WM_RBUTTONUP) {
+                uint8_t button = (msg.message == WM_LBUTTONDOWN || msg.message == WM_LBUTTONUP) ? 0 : 1;
+                uint8_t isDown = (msg.message == WM_LBUTTONDOWN || msg.message == WM_RBUTTONDOWN) ? 1 : 0;
+
+                char packet[3];
+                packet[0] = 0x05;
+                packet[1] = button;
+                packet[2] = isDown;
+                sendto(inputSocket, packet, 3, 0, (struct sockaddr*)&hostInputAddr, sizeof(hostInputAddr));
+            }
+
+            // --- MOUSE MOVEMENT (Split Logic) ---
+            else if (msg.message == WM_MOUSEMOVE) {
+                if (isGameMode) {
+                    // 1. GAME MODE (Center-Locked Infinite Radius)
+                    SetCursor(NULL); // Force the cursor to stay invisible!
+
+                    POINT pt;
+                    GetCursorPos(&pt);
+
+                    POINT center = { clientW / 2, clientH / 2 };
+                    ClientToScreen(hWnd, &center);
+
+                    // Ignore the synthetic event generated by our own SetCursorPos
+                    if (pt.x != center.x || pt.y != center.y) {
+                        int dx = pt.x - center.x;
+                        int dy = pt.y - center.y;
+
+                        char packet[9] = { 0x06 };
+                        memcpy(packet + 1, &dx, 4);
+                        memcpy(packet + 5, &dy, 4);
+                        sendto(inputSocket, packet, 9, 0, (struct sockaddr*)&hostInputAddr, sizeof(hostInputAddr));
+
+                        // Force the physical cursor back to the dead center!
+                        SetCursorPos(center.x, center.y);
+                    }
+                }
+                else {
+                    // 2. DESKTOP MODE (Absolute Scaling)
+                    SetCursor(LoadCursor(NULL, IDC_ARROW)); // Bring the arrow back!
+
+                    int scaledX = (LOWORD(msg.lParam) * 65535) / clientW;
+                    int scaledY = (HIWORD(msg.lParam) * 65535) / clientH;
+
+                    char packet[9];
+                    packet[0] = 0x03;
+                    memcpy(packet + 1, &scaledX, 4);
+                    memcpy(packet + 5, &scaledY, 4);
+                    sendto(inputSocket, packet, 9, 0, (struct sockaddr*)&hostInputAddr, sizeof(hostInputAddr));
+                }
+            }
+
+            // --- KEYBOARD ---
+            else if (msg.message == WM_KEYDOWN || msg.message == WM_KEYUP) {
+                char packet[3];
+                packet[0] = 0x04;
+                packet[1] = (uint8_t)msg.wParam;
+                packet[2] = (msg.message == WM_KEYDOWN) ? 1 : 0;
+                sendto(inputSocket, packet, 3, 0, (struct sockaddr*)&hostInputAddr, sizeof(hostInputAddr));
+            }
+
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
         }
 
         int bytesRead;
         // DRAIN the entire UDP buffer every single frame iteration
         while ((bytesRead = recv(recvSocket, packetBuffer.data(), (int)packetBuffer.size(), 0)) > 0) {
-            if (!timingStarted) {
-                QueryPerformanceCounter(&frameStart);
-                timingStarted = true;
-            }
 
-            uint8_t* data = (uint8_t*)packetBuffer.data();
-            int data_size = bytesRead;
+            uint8_t header = packetBuffer[0];
+            uint8_t* payload = (uint8_t*)packetBuffer.data() + 1;
+            int payloadSize = bytesRead - 1;
 
-            // Push every packet into the parser immediately
-            while (data_size > 0) {
-                int ret = av_parser_parse2(parser, codec_ctx, &pkt->data, &pkt->size,
-                    data, data_size, AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0);
-                data += ret;
-                data_size -= ret;
+            if (header == 0x01) {
+                // ==========================================
+                // ROUTE 1: VIDEO DATA
+                // ==========================================
+                if (!timingStarted) {
+                    QueryPerformanceCounter(&frameStart);
+                    timingStarted = true;
+                }
 
-                if (pkt->size) {
-                    // Send the packet to the decoder
-                    int send_ret = avcodec_send_packet(codec_ctx, pkt);
-                    
-                    // IF the decoder is full or erroring out, we drop it.
-                    // But if it accepted it, we try to receive the frame.
-                    if (send_ret == 0) {
-                        bool gotNewFrame = false;
-                        
-                        // Try to receive a frame. If it returns AVERROR(EAGAIN), 
-                        // it means "I need more UDP packets to finish this frame."
-                        // We ONLY move forward if we actually got a full 0 return.
-                        while (avcodec_receive_frame(codec_ctx, frame) == 0) {
-                            av_frame_move_ref(latestFrame, frame);
-                            gotNewFrame = true;
-                        }
+                while (payloadSize > 0) {
+                    int ret = av_parser_parse2(parser, codec_ctx, &pkt->data, &pkt->size,
+                        payload, payloadSize, AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0);
+                    payload += ret;
+                    payloadSize -= ret;
 
-                        if (gotNewFrame) {
-                            // --- AUTOMATIC MODULAR SETUP ---
-                            // If the texture doesn't exist yet, build it using the stream's exact dimensions!
-                            if (!g_pDisplayTexture) {
-                                int streamW = latestFrame->width;
-                                int streamH = latestFrame->height;
-                                std::cout << "\n[DX11] Incoming stream detected! Building GPU pipeline for " << streamW << "x" << streamH << "...\n";
+                    if (pkt->size) {
+                        // Send packet to FFmpeg Decoder
+                        if (avcodec_send_packet(codec_ctx, pkt) == 0) {
+                            bool gotNewFrame = false;
 
-                                // 1. Dynamic Texture
-                                D3D11_TEXTURE2D_DESC texDesc = { 0 };
-                                texDesc.Width = streamW;
-                                texDesc.Height = streamH;
-                                texDesc.MipLevels = 1;
-                                texDesc.ArraySize = 1;
-                                texDesc.Format = DXGI_FORMAT_NV12;
-                                texDesc.SampleDesc.Count = 1;
-                                texDesc.Usage = D3D11_USAGE_DEFAULT;
-                                texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-                                dev->CreateTexture2D(&texDesc, NULL, &g_pDisplayTexture);
-
-                                // 2. Dynamic SRVs
-                                D3D11_SHADER_RESOURCE_VIEW_DESC srvDescY = {};
-                                srvDescY.Format = DXGI_FORMAT_R8_UNORM;
-                                srvDescY.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-                                srvDescY.Texture2D.MipLevels = 1;
-                                dev->CreateShaderResourceView(g_pDisplayTexture, &srvDescY, &g_pLumaSRV);
-
-                                D3D11_SHADER_RESOURCE_VIEW_DESC srvDescUV = {};
-                                srvDescUV.Format = DXGI_FORMAT_R8G8_UNORM;
-                                srvDescUV.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-                                srvDescUV.Texture2D.MipLevels = 1;
-                                dev->CreateShaderResourceView(g_pDisplayTexture, &srvDescUV, &g_pChromaSRV);
-
-                                // 3. Dynamic Constant Buffer (For the shader math)
-                                struct SceneBuffer { float height; float padding[3]; };
-                                SceneBuffer sb = { (float)streamH };
-                                D3D11_BUFFER_DESC cbDesc = { 0 };
-                                cbDesc.ByteWidth = sizeof(SceneBuffer);
-                                cbDesc.Usage = D3D11_USAGE_DEFAULT;
-                                cbDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-                                D3D11_SUBRESOURCE_DATA cbData = { &sb };
-                                dev->CreateBuffer(&cbDesc, &cbData, &g_pConstantBuffer);
-                                g_pContext->PSSetConstantBuffers(0, 1, &g_pConstantBuffer);
+                            // Drain all available frames
+                            while (avcodec_receive_frame(codec_ctx, frame) == 0) {
+                                av_frame_move_ref(latestFrame, frame);
+                                gotNewFrame = true;
                             }
-                            // -------------------------------
 
-                            ID3D11Texture2D* hwTexture = (ID3D11Texture2D*)latestFrame->data[0];
-                            UINT sliceIndex = (UINT)(uintptr_t)latestFrame->data[1];
+                            if (gotNewFrame) {
+                                // --- AUTOMATIC MODULAR SETUP ---
+                                if (!g_pDisplayTexture) {
+                                    int streamW = latestFrame->width;
+                                    int streamH = latestFrame->height;
+                                    std::cout << "\n[DX11] Incoming stream detected! Building GPU pipeline for " << streamW << "x" << streamH << "...\n";
 
-                            g_pContext->CopySubresourceRegion(g_pDisplayTexture, 0, 0, 0, 0,
-                                hwTexture, sliceIndex, NULL);
+                                    // 1. Dynamic Texture
+                                    D3D11_TEXTURE2D_DESC texDesc = { 0 };
+                                    texDesc.Width = streamW;
+                                    texDesc.Height = streamH;
+                                    texDesc.MipLevels = 1;
+                                    texDesc.ArraySize = 1;
+                                    texDesc.Format = DXGI_FORMAT_NV12;
+                                    texDesc.SampleDesc.Count = 1;
+                                    texDesc.Usage = D3D11_USAGE_DEFAULT;
+                                    texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+                                    dev->CreateTexture2D(&texDesc, NULL, &g_pDisplayTexture);
 
-                            g_newFrameReady.store(true);
+                                    // 2. Dynamic SRVs
+                                    D3D11_SHADER_RESOURCE_VIEW_DESC srvDescY = {};
+                                    srvDescY.Format = DXGI_FORMAT_R8_UNORM;
+                                    srvDescY.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+                                    srvDescY.Texture2D.MipLevels = 1;
+                                    dev->CreateShaderResourceView(g_pDisplayTexture, &srvDescY, &g_pLumaSRV);
 
-                            // Free the hardware surface immediately so FFmpeg doesn't crash!
-                            av_frame_unref(latestFrame);
+                                    D3D11_SHADER_RESOURCE_VIEW_DESC srvDescUV = {};
+                                    srvDescUV.Format = DXGI_FORMAT_R8G8_UNORM;
+                                    srvDescUV.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+                                    srvDescUV.Texture2D.MipLevels = 1;
+                                    dev->CreateShaderResourceView(g_pDisplayTexture, &srvDescUV, &g_pChromaSRV);
 
-                            QueryPerformanceCounter(&frameEnd);
-                            clientLatencyMs = ((double)(frameEnd.QuadPart - frameStart.QuadPart) * 1000.0) / timerFreq.QuadPart;
-                            timingStarted = false;
+                                    // 3. Dynamic Constant Buffer (For the shader math)
+                                    struct SceneBuffer { float height; float padding[3]; };
+                                    SceneBuffer sb = { (float)streamH };
+                                    D3D11_BUFFER_DESC cbDesc = { 0 };
+                                    cbDesc.ByteWidth = sizeof(SceneBuffer);
+                                    cbDesc.Usage = D3D11_USAGE_DEFAULT;
+                                    cbDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+                                    D3D11_SUBRESOURCE_DATA cbData = { &sb };
+                                    dev->CreateBuffer(&cbDesc, &cbData, &g_pConstantBuffer);
+                                    g_pContext->PSSetConstantBuffers(0, 1, &g_pConstantBuffer);
+                                }
+                                // -------------------------------
+
+                                ID3D11Texture2D* hwTexture = (ID3D11Texture2D*)latestFrame->data[0];
+                                UINT sliceIndex = (UINT)(uintptr_t)latestFrame->data[1];
+
+                                g_pContext->CopySubresourceRegion(g_pDisplayTexture, 0, 0, 0, 0,
+                                    hwTexture, sliceIndex, NULL);
+                                g_newFrameReady.store(true);
+
+                                // Free the hardware surface immediately so FFmpeg doesn't crash!
+                                av_frame_unref(latestFrame);
+
+                                QueryPerformanceCounter(&frameEnd);
+                                clientLatencyMs = ((double)(frameEnd.QuadPart - frameStart.QuadPart) * 1000.0) / timerFreq.QuadPart;
+                                timingStarted = false;
+                            }
                         }
+                        av_packet_unref(pkt);
                     }
-                    av_packet_unref(pkt);
+                }
+            }
+            else if (header == 0x02) {
+                // ==========================================
+                // ROUTE 2: AUDIO DATA
+                // ==========================================
+                // Decompress the Opus packet back into raw 32-bit floats
+                int decodedSamples = opus_decode_float(opusDec, payload, payloadSize, audioRing[ringIdx].data(), 960, 0);
+
+                if (decodedSamples > 0) {
+                    XAUDIO2_BUFFER buffer = { 0 };
+                    buffer.AudioBytes = decodedSamples * 2 * sizeof(float);
+                    buffer.pAudioData = (const BYTE*)audioRing[ringIdx].data();
+
+                    // Submit it to the sound card
+                    pSourceVoice->SubmitSourceBuffer(&buffer);
+
+                    // Move to the next slot in the ring buffer
+                    ringIdx = (ringIdx + 1) % AUDIO_BUFFERS;
                 }
             }
         }
@@ -569,6 +735,12 @@ int main() {
     if (g_pSwapChain)      g_pSwapChain->Release();
     if (dev)               dev->Release();
     if (g_pConstantBuffer) g_pConstantBuffer->Release();
+    // Cleanup Audio
+    if (opusDec) opus_decoder_destroy(opusDec);
+    if (pSourceVoice) pSourceVoice->DestroyVoice();
+    if (pMasterVoice) pMasterVoice->DestroyVoice();
+    if (pXAudio2) pXAudio2->Release();
+    CoUninitialize();
 
     closesocket(recvSocket);
     WSACleanup();
