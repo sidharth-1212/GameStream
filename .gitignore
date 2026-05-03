@@ -1,0 +1,28 @@
+# Prerequisites
+*.com
+*.class
+*.dll
+*.exe
+*.o
+*.so
+
+# Visual Studio specific
+.vs/
+Debug/
+Release/
+x64/
+x86/
+bld/
+[Bb]in/
+[Oo]bj/
+*.user
+*.suo
+*.pdb
+
+# Vcpkg
+vcpkg_installed/
+vcpkg/
+
+# Local Diagnostic Outputs (from our testing)
+first_frame.yuv
+*.log
