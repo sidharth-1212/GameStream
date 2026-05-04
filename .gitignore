@@ -26,3 +26,4 @@ vcpkg/
 # Local Diagnostic Outputs (from our testing)
 first_frame.yuv
 *.log
+*.h264

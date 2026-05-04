@@ -10,6 +10,7 @@
 #include <vector>
 #include <atomic>
 #include <fstream>
+#include <string>
 #include <sstream>
 #include <iomanip>
 
@@ -19,6 +20,7 @@
 
 #include <opus/opus.h>
 #include <xaudio2.h>
+#include <queue>
 
 
 extern "C" {
@@ -70,6 +72,10 @@ ID3D11PixelShader* g_pPS = nullptr;
 ID3D11PixelShader* pPSDbg = nullptr;
 ID3D11Buffer* g_pVBuffer = nullptr;
 ID3D11SamplerState* g_pSampler = nullptr;
+
+std::queue<AVFrame*> g_jitterBuffer;
+const int MAX_BUFFER_SIZE = 2; // Strict 2-frame limit for extreme low latency
+LARGE_INTEGER g_frameTimer;    // The Metronome
 
 // ============================================================
 // DIAGNOSTIC HELPERS
@@ -198,6 +204,7 @@ static HWND CreateClientWindow() {
 
 int main() {
     SetProcessDPIAware();
+    SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED);
     timeBeginPeriod(1);
     std::cout << "=== GameStream Client (Hardware Agnostic FFmpeg Build) ===\n\n";
 
@@ -210,7 +217,33 @@ int main() {
     sockaddr_in hostInputAddr = { 0 };
     hostInputAddr.sin_family = AF_INET;
     hostInputAddr.sin_port = htons(9999);
-    inet_pton(AF_INET, "192.168.1.17", &hostInputAddr.sin_addr);
+    // =======================================================
+    // --- NEW: DYNAMIC CONFIG LOGIC (CLIENT SIDE) ---
+    // =======================================================
+    std::string targetIP;
+    std::ifstream configFile("host_ip.txt");
+
+    if (configFile.is_open()) {
+        std::getline(configFile, targetIP);
+        configFile.close();
+        std::cout << "[SYSTEM] Loaded Host IP from host_ip.txt: " << targetIP << "\n";
+    }
+    else {
+        std::cout << "\n=========================================\n";
+        std::cout << "  FIRST TIME SETUP (CLIENT)\n";
+        std::cout << "=========================================\n";
+        std::cout << "Enter the Host PC's IP Address (e.g., 192.168.1.17): ";
+        std::cin >> targetIP;
+
+        std::ofstream outFile("host_ip.txt");
+        outFile << targetIP;
+        outFile.close();
+        std::cout << "[SYSTEM] Saved to host_ip.txt for future use!\n\n";
+    }
+
+    // Pass the string we just loaded/typed into the Winsock function
+    inet_pton(AF_INET, targetIP.c_str(), &hostInputAddr.sin_addr);
+    // =======================================================
 
     SOCKET recvSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     sockaddr_in recvAddr = { 0 };
@@ -242,12 +275,13 @@ int main() {
 
     // --- DX11 device ---
     DXGI_SWAP_CHAIN_DESC scd = { 0 };
-    scd.BufferCount = 1;
+    scd.BufferCount = 2; // FIX 1: Flip Model requires at least 2 buffers (Front & Back)
     scd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     scd.OutputWindow = hWnd;
     scd.SampleDesc.Count = 1;
     scd.Windowed = TRUE;
+    scd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
 
     ID3D11Device* dev = nullptr;
     HRESULT hrDev = D3D11CreateDeviceAndSwapChain(
@@ -435,6 +469,13 @@ int main() {
     int ringIdx = 0;
     // =========================================================================
 
+    // =======================================================
+    // --- NEW: SEND WAKE-UP PING TO HOST ---
+    // =======================================================
+    char pingPacket[1] = { (char)0xFF }; // 0xFF is our custom "Hello" header
+    sendto(inputSocket, pingPacket, 1, 0, (struct sockaddr*)&hostInputAddr, sizeof(hostInputAddr));
+    std::cout << "[NET] Sent Wake-Up Ping to Host. Waiting for video...\n";
+    // =======================================================
     
 
     bool isGameMode = false;
@@ -573,73 +614,25 @@ int main() {
 
                     if (pkt->size) {
                         // Send packet to FFmpeg Decoder
+                        // Send packet to FFmpeg Decoder
                         if (avcodec_send_packet(codec_ctx, pkt) == 0) {
-                            bool gotNewFrame = false;
 
                             // Drain all available frames
                             while (avcodec_receive_frame(codec_ctx, frame) == 0) {
-                                av_frame_move_ref(latestFrame, frame);
-                                gotNewFrame = true;
-                            }
 
-                            if (gotNewFrame) {
-                                // --- AUTOMATIC MODULAR SETUP ---
-                                if (!g_pDisplayTexture) {
-                                    int streamW = latestFrame->width;
-                                    int streamH = latestFrame->height;
-                                    std::cout << "\n[DX11] Incoming stream detected! Building GPU pipeline for " << streamW << "x" << streamH << "...\n";
+                                // 1. Clone the hardware reference 
+                                AVFrame* queuedFrame = av_frame_alloc();
+                                av_frame_move_ref(queuedFrame, frame);
 
-                                    // 1. Dynamic Texture
-                                    D3D11_TEXTURE2D_DESC texDesc = { 0 };
-                                    texDesc.Width = streamW;
-                                    texDesc.Height = streamH;
-                                    texDesc.MipLevels = 1;
-                                    texDesc.ArraySize = 1;
-                                    texDesc.Format = DXGI_FORMAT_NV12;
-                                    texDesc.SampleDesc.Count = 1;
-                                    texDesc.Usage = D3D11_USAGE_DEFAULT;
-                                    texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-                                    dev->CreateTexture2D(&texDesc, NULL, &g_pDisplayTexture);
+                                // 2. Push it into the Waiting Room
+                                g_jitterBuffer.push(queuedFrame);
 
-                                    // 2. Dynamic SRVs
-                                    D3D11_SHADER_RESOURCE_VIEW_DESC srvDescY = {};
-                                    srvDescY.Format = DXGI_FORMAT_R8_UNORM;
-                                    srvDescY.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-                                    srvDescY.Texture2D.MipLevels = 1;
-                                    dev->CreateShaderResourceView(g_pDisplayTexture, &srvDescY, &g_pLumaSRV);
-
-                                    D3D11_SHADER_RESOURCE_VIEW_DESC srvDescUV = {};
-                                    srvDescUV.Format = DXGI_FORMAT_R8G8_UNORM;
-                                    srvDescUV.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-                                    srvDescUV.Texture2D.MipLevels = 1;
-                                    dev->CreateShaderResourceView(g_pDisplayTexture, &srvDescUV, &g_pChromaSRV);
-
-                                    // 3. Dynamic Constant Buffer (For the shader math)
-                                    struct SceneBuffer { float height; float padding[3]; };
-                                    SceneBuffer sb = { (float)streamH };
-                                    D3D11_BUFFER_DESC cbDesc = { 0 };
-                                    cbDesc.ByteWidth = sizeof(SceneBuffer);
-                                    cbDesc.Usage = D3D11_USAGE_DEFAULT;
-                                    cbDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-                                    D3D11_SUBRESOURCE_DATA cbData = { &sb };
-                                    dev->CreateBuffer(&cbDesc, &cbData, &g_pConstantBuffer);
-                                    g_pContext->PSSetConstantBuffers(0, 1, &g_pConstantBuffer);
+                                // 3. THE LATENCY SAVIOR (Drop-Head Optimization)
+                                if (g_jitterBuffer.size() > MAX_BUFFER_SIZE) {
+                                    AVFrame* droppedFrame = g_jitterBuffer.front();
+                                    g_jitterBuffer.pop();
+                                    av_frame_free(&droppedFrame);
                                 }
-                                // -------------------------------
-
-                                ID3D11Texture2D* hwTexture = (ID3D11Texture2D*)latestFrame->data[0];
-                                UINT sliceIndex = (UINT)(uintptr_t)latestFrame->data[1];
-
-                                g_pContext->CopySubresourceRegion(g_pDisplayTexture, 0, 0, 0, 0,
-                                    hwTexture, sliceIndex, NULL);
-                                g_newFrameReady.store(true);
-
-                                // Free the hardware surface immediately so FFmpeg doesn't crash!
-                                av_frame_unref(latestFrame);
-
-                                QueryPerformanceCounter(&frameEnd);
-                                clientLatencyMs = ((double)(frameEnd.QuadPart - frameStart.QuadPart) * 1000.0) / timerFreq.QuadPart;
-                                timingStarted = false;
                             }
                         }
                         av_packet_unref(pkt);
@@ -745,15 +738,86 @@ int main() {
         }
 
         // Render
-        // Render
-        if (g_pRTV) {
-            float clearColor[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
-            g_pContext->ClearRenderTargetView(g_pRTV, clearColor);
+        // =========================================================================
+        // --- NEW: THE 60Hz METRONOME ---
+        // =========================================================================
+        QueryPerformanceCounter(&frameEnd);
 
-            if (firstFrameReceived) {
+        // 16.666 milliseconds = exactly 60 FPS pacing
+        double elapsedMs = ((double)(frameEnd.QuadPart - g_frameTimer.QuadPart) * 1000.0) / timerFreq.QuadPart;
+
+        if (elapsedMs >= 16.666) {
+            // Reset the metronome for the next beat
+            g_frameTimer = frameEnd;
+
+            // 1. Pull the oldest frame out of the Jitter Buffer
+            AVFrame* frameToRender = nullptr;
+            if (!g_jitterBuffer.empty()) {
+                frameToRender = g_jitterBuffer.front();
+                g_jitterBuffer.pop();
+            }
+
+            // 2. Upload and Render!
+            if (frameToRender && g_pRTV) {
+
+                // --- Upload the frame to the GPU Pipeline ---
+                if (!g_pDisplayTexture) {
+                    int streamW = frameToRender->width;
+                    int streamH = frameToRender->height;
+                    std::cout << "\n[DX11] Incoming stream detected! Building GPU pipeline for " << streamW << "x" << streamH << "...\n";
+
+                    // 1. Dynamic Texture
+                    D3D11_TEXTURE2D_DESC texDesc = { 0 };
+                    texDesc.Width = streamW;
+                    texDesc.Height = streamH;
+                    texDesc.MipLevels = 1;
+                    texDesc.ArraySize = 1;
+                    texDesc.Format = DXGI_FORMAT_NV12;
+                    texDesc.SampleDesc.Count = 1;
+                    texDesc.Usage = D3D11_USAGE_DEFAULT;
+                    texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+                    dev->CreateTexture2D(&texDesc, NULL, &g_pDisplayTexture);
+
+                    // 2. Dynamic SRVs
+                    D3D11_SHADER_RESOURCE_VIEW_DESC srvDescY = {};
+                    srvDescY.Format = DXGI_FORMAT_R8_UNORM;
+                    srvDescY.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+                    srvDescY.Texture2D.MipLevels = 1;
+                    dev->CreateShaderResourceView(g_pDisplayTexture, &srvDescY, &g_pLumaSRV);
+
+                    D3D11_SHADER_RESOURCE_VIEW_DESC srvDescUV = {};
+                    srvDescUV.Format = DXGI_FORMAT_R8G8_UNORM;
+                    srvDescUV.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+                    srvDescUV.Texture2D.MipLevels = 1;
+                    dev->CreateShaderResourceView(g_pDisplayTexture, &srvDescUV, &g_pChromaSRV);
+
+                    // 3. Dynamic Constant Buffer
+                    struct SceneBuffer { float height; float padding[3]; };
+                    SceneBuffer sb = { (float)streamH };
+                    D3D11_BUFFER_DESC cbDesc = { 0 };
+                    cbDesc.ByteWidth = sizeof(SceneBuffer);
+                    cbDesc.Usage = D3D11_USAGE_DEFAULT;
+                    cbDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+                    D3D11_SUBRESOURCE_DATA cbData = { &sb };
+                    dev->CreateBuffer(&cbDesc, &cbData, &g_pConstantBuffer);
+                    g_pContext->PSSetConstantBuffers(0, 1, &g_pConstantBuffer);
+                }
+
+                ID3D11Texture2D* hwTexture = (ID3D11Texture2D*)frameToRender->data[0];
+                UINT sliceIndex = (UINT)(uintptr_t)frameToRender->data[1];
+
+                g_pContext->CopySubresourceRegion(g_pDisplayTexture, 0, 0, 0, 0, hwTexture, sliceIndex, NULL);
+
+                // Free the FFmpeg memory immediately after we extract the DX11 texture
+                av_frame_free(&frameToRender);
+                firstFrameReceived = true;
+
+                // --- Draw to the screen ---
+                float clearColor[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+                g_pContext->ClearRenderTargetView(g_pRTV, clearColor);
+
                 g_pContext->OMSetRenderTargets(1, &g_pRTV, NULL);
 
-                // FIX: Pass both Luma and Chroma to the shader
                 ID3D11ShaderResourceView* srvs[2] = { g_pLumaSRV, g_pChromaSRV };
                 g_pContext->PSSetShaderResources(0, 2, srvs);
 
@@ -761,9 +825,12 @@ int main() {
 
                 ID3D11ShaderResourceView* nullSRVs[2] = { nullptr, nullptr };
                 g_pContext->PSSetShaderResources(0, 2, nullSRVs);
+
+                // Because we are using Flip Discard, this bypasses DWM and hits the glass instantly
+                g_pSwapChain->Present(0, 0);
             }
         }
-        if (g_pSwapChain) g_pSwapChain->Present(0, 0);
+        // =========================================================================
 
         // --- LATENCY MATH & WINDOW TITLE UPDATE ---
         if (firstFrameReceived) {
@@ -820,6 +887,6 @@ int main() {
     WSACleanup();
 
     timeEndPeriod(1);
-
+    SetThreadExecutionState(ES_CONTINUOUS);
     return 0;
 }

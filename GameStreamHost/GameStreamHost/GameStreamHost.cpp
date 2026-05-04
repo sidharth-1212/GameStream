@@ -11,6 +11,8 @@
 #include <mmsystem.h>
 #include <iostream>
 #include <vector>
+#include <fstream>
+#include <string>
 #include <d3d11.h>
 #include <dxgi1_2.h>
 #include "nvEncodeAPI.h"
@@ -26,6 +28,7 @@
 #pragma comment(lib, "ole32.lib")
 
 std::atomic<bool> g_running{ true };
+std::atomic<bool> g_clientConnected{ false }; // <-- ADD THIS
 
 SOCKET g_sendSocket;
 sockaddr_in g_destAddr;
@@ -179,8 +182,25 @@ void InputInjectionThread() {
     while (g_running) {
         int bytes = recvfrom(g_inputRecvSocket, buf, sizeof(buf), 0, (struct sockaddr*)&clientAddr, &clientLen);
         if (bytes > 0) {
+            if (!g_clientConnected) {
+                // We got our first packet! Lock onto this IP.
+                g_destAddr.sin_family = AF_INET;
+                g_destAddr.sin_port = htons(8888); // Target the Client's video/audio port
+
+                g_destAddr.sin_addr = clientAddr.sin_addr; // Copy the IP from the incoming packet
+
+                char ipStr[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &(g_destAddr.sin_addr), ipStr, INET_ADDRSTRLEN);
+                std::cout << "\n[NETWORK] Wild Client Appeared! Locked onto IP: " << ipStr << "\n";
+
+                g_clientConnected = true; // Release the GPU pipeline!
+            }
+            // ---------------------------------------
+
             // PROTOCOL: [TYPE (1b)] [X (4b)] [Y (4b)] [K_DATA (1b)]
             uint8_t type = buf[0];
+
+            if (type == 0xFF) continue; // Ignore the ping packet, we just needed it for the IP!
 
             if (type == 0x03) { // MOUSE MOVE (Absolute)
                 // FIX: Read the incoming bytes as Integers!
@@ -256,20 +276,27 @@ int main() {
 
     g_destAddr.sin_family = AF_INET;
     g_destAddr.sin_port = htons(8888);
-    inet_pton(AF_INET, "192.168.1.24", &g_destAddr.sin_addr); // Target IP
 
-    std::cout << "Connecting to Client..." << std::endl;
-    // FIX: Update the connect statement to use the global variables too
-    while (connect(g_sendSocket, (struct sockaddr*)&g_destAddr, sizeof(g_destAddr)) == SOCKET_ERROR) {
-        Sleep(500);
+    std::thread inputThread(InputInjectionThread);
+    inputThread.detach();
+
+    // 2. NOW WE CAN GO TO SLEEP AND WAIT!
+    // =======================================================
+    // --- NEW: WAIT FOR CLIENT TO PUNCH FIRST ---
+    // =======================================================
+    std::cout << "\n[NETWORK] Engine sleeping. Waiting for a Client to connect...\n";
+
+    while (g_running && !g_clientConnected) {
+        Sleep(100); // Sleep lightly until the Input Thread flips the flag
     }
+
+    if (!g_running) return 0; // Safely exit if user pressed Ctrl+C while waiting
+    // =======================================================
+
     std::cout << "Connected! Initializing Encoder..." << std::endl;
 
     std::thread audioThread(AudioStreamThread);
     audioThread.detach();
-
-    std::thread inputThread(InputInjectionThread);
-    inputThread.detach();
 
     // Hide the local cursor on the host
     ShowCursor(FALSE);
