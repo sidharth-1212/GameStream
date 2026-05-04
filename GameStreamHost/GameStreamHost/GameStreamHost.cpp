@@ -29,6 +29,11 @@
 
 std::atomic<bool> g_running{ true };
 std::atomic<bool> g_clientConnected{ false }; // <-- ADD THIS
+std::atomic<bool> g_forceReboot{ false };
+std::atomic<bool> g_isStreaming{ false };
+std::atomic<DWORD> g_lastClientContact{ 0 };
+std::atomic<int> g_clientReqWidth{ 0 };  // <-- ADD THIS
+std::atomic<int> g_clientReqHeight{ 0 }; // <-- ADD THIS
 
 // =======================================================
 // --- NEW: DYNAMIC BITRATE GLOBALS ---
@@ -201,6 +206,7 @@ void InputInjectionThread() {
     while (g_running) {
         int bytes = recvfrom(g_inputRecvSocket, buf, sizeof(buf), 0, (struct sockaddr*)&clientAddr, &clientLen);
         if (bytes > 0) {
+            g_lastClientContact = GetTickCount();
             if (!g_clientConnected) {
                 // We got our first packet! Lock onto this IP.
                 g_destAddr.sin_family = AF_INET;
@@ -219,7 +225,39 @@ void InputInjectionThread() {
             // PROTOCOL: [TYPE (1b)] [X (4b)] [Y (4b)] [K_DATA (1b)]
             uint8_t type = buf[0];
 
-            if (type == 0xFF) continue; // Ignore the ping packet, we just needed it for the IP!
+            if (type == 0xFF && bytes == 9) {
+                int newW = *(int*)(buf + 1);
+                int newH = *(int*)(buf + 5);
+
+                if (g_clientConnected) {
+                    // THE FIX: Ignore the Client's frantic pinging while we are busy building the GPU!
+                    if (g_isStreaming) {
+                        std::cout << "[NET] Client Reconnect Detected. Rebooting Pipeline...\n";
+                        g_forceReboot = true;
+                    }
+                }
+                else {
+                    g_destAddr.sin_family = AF_INET;
+                    g_destAddr.sin_port = htons(8888);
+                    g_destAddr.sin_addr = clientAddr.sin_addr;
+                    g_clientConnected = true;
+                    std::cout << "[NET] Handshake Success: " << newW << "x" << newH << "\n";
+                }
+
+                g_clientReqWidth = newW;
+                g_clientReqHeight = newH;
+                continue;
+            }
+            if (!g_clientConnected) continue;
+
+            if (type == 0xFF) {
+                if (bytes == 9) { // Ensure it's our new Smart Ping
+                    g_clientReqWidth = *(int*)(buf + 1);
+                    g_clientReqHeight = *(int*)(buf + 5);
+                    std::cout << "[NET] Client requested stream at: " << g_clientReqWidth << "x" << g_clientReqHeight << "\n";
+                }
+                continue;
+            }
 
             // =======================================================
             // --- NEW: CATCH NACK REQUESTS ---
@@ -371,6 +409,16 @@ int main() {
     ShowCursor(FALSE);
 
     while (g_running) {
+        if (!g_clientConnected) {
+            std::cout << "\n[NETWORK] Engine sleeping. Waiting for a Client to connect...\n";
+            while (g_running && !g_clientConnected) {
+                Sleep(100);
+            }
+            if (!g_running) break;
+
+            // Reset the death timer so we don't immediately disconnect!
+            g_lastClientContact = GetTickCount();
+        }
         std::cout << "\n[SYSTEM] Initializing GPU & Encoder Pipeline..." << std::endl;
 
         // =========================================================================
@@ -474,11 +522,19 @@ int main() {
 
         g_nvencInitParams.encodeGUID = encodeGUID;
         g_nvencInitParams.presetGUID = presetGUID;
+
+        // =======================================================
+        // THE FIX: NATIVE ENCODING ONLY (Prevents Macroblock Padding)
+        // =======================================================
         g_nvencInitParams.encodeWidth = activeWidth;
         g_nvencInitParams.encodeHeight = activeHeight;
+        g_nvencInitParams.darWidth = activeWidth;
+        g_nvencInitParams.darHeight = activeHeight;
+
         g_nvencInitParams.frameRateNum = 60;
         g_nvencInitParams.frameRateDen = 1;
         g_nvencInitParams.enablePTD = 1;
+        // =======================================================
 
         g_nvencConfig.gopLength = 60;
         g_nvencConfig.encodeCodecConfig.h264Config.idrPeriod = 60;
@@ -544,7 +600,18 @@ int main() {
         bool pipelineBroken = false;
         std::cout << "Phase D: Streaming. Press ESCAPE to stop." << std::endl;
 
+        g_isStreaming = true;
+
         while (g_running && !pipelineBroken) {
+            if (g_forceReboot || GetTickCount() - g_lastClientContact > 3000) {
+                std::cout << "\n[NETWORK] Client lost or requested reboot. Resetting Engine...\n";
+                pipelineBroken = true;
+                g_clientConnected = false;
+
+                g_sequenceCounter = 0; // CRITICAL: Start over at Packet 0
+                g_forceReboot = false;
+                continue;
+            }
             IDXGIResource* desktopResource = nullptr;
             DXGI_OUTDUPL_FRAME_INFO frameInfo;
 
@@ -713,7 +780,8 @@ int main() {
             // Unmap so the bridge texture is free to be written next frame
             nvenc.nvEncUnmapInputResource(encoderSession, mapRes.mappedResource);
         }
-    
+        
+        g_isStreaming = false;
 
         if (encoderSession) {
             nvenc.nvEncUnregisterResource(encoderSession, regRes.registeredResource);

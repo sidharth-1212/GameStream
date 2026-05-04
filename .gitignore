@@ -27,3 +27,4 @@ vcpkg/
 first_frame.yuv
 *.log
 *.h264
+host_ip.txt

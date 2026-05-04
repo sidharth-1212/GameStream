@@ -46,11 +46,6 @@ extern "C" {
     __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
 }
 
-const int FRAME_WIDTH = 1920;
-const int FRAME_HEIGHT = 1080;   // FIX: Changed from 1200 to 1080
-const int CODED_HEIGHT = 1080;   // FIX: Changed from 1200 to 1080
-const int TEXTURE_HEIGHT = 2160; // Y(1080) + U(540) + V(540)
-
 HCURSOR g_remoteCursor = NULL;
 
 // ==========================================
@@ -84,7 +79,6 @@ ID3D11ShaderResourceView* g_pChromaSRV = nullptr; // NEW: Color view for NV12
 ID3D11ShaderResourceView* g_pDisplaySRV = nullptr;
 ID3D11Buffer* g_pConstantBuffer = nullptr;
 static std::vector<uint8_t> g_frameBuffer;
-static size_t               g_frameRowPitch = FRAME_WIDTH;
 static std::atomic<bool>    g_newFrameReady{ false };
 
 IDXGISwapChain* g_pSwapChain = nullptr;
@@ -113,40 +107,12 @@ int g_packetsLostThisSecond = 0;
 double g_currentPingMs = 0.0;
 int g_displayFPS = 0;
 
-// ============================================================
-// DIAGNOSTIC HELPERS
-// ============================================================
+DWORD g_lastHostContact = 0;
+DWORD g_lastWakePing = 0;
+bool g_hostIsAlive = false;
 
-static void DumpBytes(const char* label, const uint8_t* data, size_t len) {
-    size_t show = (len < 256) ? len : 256;
-    std::ostringstream oss;
-    oss << "\n[DUMP] " << label << " (first " << show << " of " << len << " bytes):\n";
-    for (size_t i = 0; i < show; i++) {
-        oss << std::hex << std::setw(2) << std::setfill('0') << (int)data[i] << " ";
-        if ((i + 1) % 16 == 0) oss << "\n";
-    }
-    oss << std::dec << "\n";
-    std::cout << oss.str();
-}
-
-static void SaveFirstFrameYUV(const uint8_t* data, size_t rowPitch) {
-    static bool saved = false;
-    if (saved) return;
-    saved = true;
-
-    std::ofstream f("first_frame.yuv", std::ios::binary);
-    if (!f) { std::cerr << "[DIAG] Could not write first_frame.yuv\n"; return; }
-
-    for (int row = 0; row < FRAME_HEIGHT; row++)
-        f.write((char*)(data + row * rowPitch), FRAME_WIDTH);
-
-    for (int row = 0; row < CODED_HEIGHT / 2; row++)
-        f.write((char*)(data + (CODED_HEIGHT + row) * rowPitch), FRAME_WIDTH);
-
-    f.close();
-    std::cout << "[DIAG] Saved first_frame.yuv (" << FRAME_WIDTH << "x" << FRAME_HEIGHT
-        << " NV12). Open with ffplay.\n";
-}
+int g_streamW = 0;
+int g_streamH = 0;
 
 // ============================================================
 // SHADER SOURCE
@@ -194,6 +160,9 @@ float4 main(PixelInputType input) : SV_TARGET {
 )";
 
 const char* pixelShaderDebugSrc = R"(
+cbuffer SceneData : register(b0) {
+    float streamHeight; // This is actually the video height!
+};
 Texture2D shaderTexture : register(t0);
 SamplerState SampleType : register(s0);
 
@@ -203,8 +172,10 @@ struct PixelInputType {
 };
 
 float4 main(PixelInputType input) : SV_TARGET {
-    uint x = clamp((uint)(input.tex.x * 1920.0f), 0u, 1919u);
-    uint y = clamp((uint)(input.tex.y * 1200.0f), 0u, 1199u);
+    // Math fix: Use the dynamic streamHeight to calculate the UV load
+    float streamWidth = streamHeight * (1.6f); // Assume 16:10 or calculate properly
+    uint x = (uint)(input.tex.x * (streamWidth - 1));
+    uint y = (uint)(input.tex.y * (streamHeight - 1));
     float v = shaderTexture.Load(int3(x, y, 0)).r;
     return float4(v, v, v, 1.0f); 
 }
@@ -239,7 +210,23 @@ static HWND CreateClientWindow() {
 // ============================================================
 
 int main() {
-    SetProcessDPIAware();
+
+    typedef BOOL(WINAPI* SetProcessDpiAwarenessContextProc)(DPI_AWARENESS_CONTEXT);
+    HMODULE user32 = LoadLibraryA("user32.dll");
+    if (user32) {
+        SetProcessDpiAwarenessContextProc setDpiCtx = (SetProcessDpiAwarenessContextProc)GetProcAddress(user32, "SetProcessDpiAwarenessContext");
+        if (setDpiCtx) {
+            setDpiCtx(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        }
+        else {
+            SetProcessDPIAware(); // Fallback for older Windows
+        }
+        FreeLibrary(user32);
+    }
+    else {
+        SetProcessDPIAware();
+    }
+
     SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED);
     timeBeginPeriod(1);
     std::cout << "=== GameStream Client (Hardware Agnostic FFmpeg Build) ===\n\n";
@@ -538,9 +525,13 @@ int main() {
     // =======================================================
     // --- NEW: SEND WAKE-UP PING TO HOST ---
     // =======================================================
-    char pingPacket[1] = { (char)0xFF }; // 0xFF is our custom "Hello" header
-    sendto(inputSocket, pingPacket, 1, 0, (struct sockaddr*)&hostInputAddr, sizeof(hostInputAddr));
-    std::cout << "[NET] Sent Wake-Up Ping to Host. Waiting for video...\n";
+    char pingPacket[9];
+    pingPacket[0] = 0xFF;
+    memcpy(pingPacket + 1, &clientW, 4); // 4 bytes for Width
+    memcpy(pingPacket + 5, &clientH, 4); // 4 bytes for Height
+
+    sendto(inputSocket, pingPacket, 9, 0, (struct sockaddr*)&hostInputAddr, sizeof(hostInputAddr));
+    std::cout << "[NET] Sent Wake-Up Ping. Requested Resolution: " << clientW << "x" << clientH << "\n";
     // =======================================================
     
 
@@ -666,17 +657,36 @@ int main() {
                     }
                 }
                 else {
-                    // 2. DESKTOP MODE (Absolute Scaling)
-
-                    // --- NEW: Use the dynamic remote cursor, or fallback to the Arrow ---
                     SetCursor(g_remoteCursor ? g_remoteCursor : LoadCursor(NULL, IDC_ARROW));
-                    // --------------------------------------------------------------------
+                    int mouseX = LOWORD(msg.lParam);
+                    int mouseY = HIWORD(msg.lParam);
 
-                    int scaledX = (LOWORD(msg.lParam) * 65535) / clientW;
-                    int scaledY = (HIWORD(msg.lParam) * 65535) / clientH;
+                    // Calculate actual video area on Client screen
+                    int videoW = clientW, videoH = clientH;
+                    int offsetX = 0, offsetY = 0;
 
-                    char packet[9];
-                    packet[0] = 0x03;
+                    if (g_streamW > 0 && g_streamH > 0) {
+                        float streamRatio = (float)g_streamW / (float)g_streamH;
+                        float windowRatio = (float)clientW / (float)clientH;
+
+                        if (windowRatio > streamRatio) { // Pillarbox
+                            videoW = (int)(clientH * streamRatio);
+                            offsetX = (clientW - videoW) / 2;
+                        }
+                        else { // Letterbox
+                            videoH = (int)(clientW / streamRatio);
+                            offsetY = (clientH - videoH) / 2;
+                        }
+                    }
+
+                    // Map mouse to the video area (ignore black bars)
+                    int mappedX = (mouseX - offsetX < 0) ? 0 : (mouseX - offsetX > videoW ? videoW : mouseX - offsetX);
+                    int mappedY = (mouseY - offsetY < 0) ? 0 : (mouseY - offsetY > videoH ? videoH : mouseY - offsetY);
+
+                    int scaledX = (mappedX * 65535) / (videoW > 0 ? videoW : 1);
+                    int scaledY = (mappedY * 65535) / (videoH > 0 ? videoH : 1);
+
+                    char packet[9] = { 0x03 };
                     memcpy(packet + 1, &scaledX, 4);
                     memcpy(packet + 5, &scaledY, 4);
                     sendto(inputSocket, packet, 9, 0, (struct sockaddr*)&hostInputAddr, sizeof(hostInputAddr));
@@ -699,6 +709,9 @@ int main() {
         int bytesRead;
         // DRAIN the entire UDP buffer every single frame iteration
         while ((bytesRead = recv(recvSocket, packetBuffer.data(), (int)packetBuffer.size(), 0)) > 0) {
+
+            g_lastHostContact = GetTickCount(); // <-- NEW: The Host is alive!
+            g_hostIsAlive = true;
 
             uint8_t header = packetBuffer[0];
             uint8_t* payload = (uint8_t*)packetBuffer.data() + 1;
@@ -899,114 +912,218 @@ int main() {
             // Reset the metronome for the next beat
             g_frameTimer = frameEnd;
 
-            // 1. Pull the oldest frame out of the Jitter Buffer
-            AVFrame* frameToRender = nullptr;
-            if (!g_jitterBuffer.empty()) {
-                frameToRender = g_jitterBuffer.front();
-                g_jitterBuffer.pop();
+            // =======================================================
+            // --- NEW: HOST DISCONNECT DETECTION ---
+            // =======================================================
+            if (GetTickCount() - g_lastHostContact > 3000) {
+                if (g_hostIsAlive) {
+                    std::cout << "\n[SYSTEM] Host connection lost. Initiating Hard Reset...\n";
+                    g_hostIsAlive = false;
+                }
+
+                if (g_pDisplayTexture) {
+                    if (g_pLumaSRV) { g_pLumaSRV->Release(); g_pLumaSRV = nullptr; }
+                    if (g_pChromaSRV) { g_pChromaSRV->Release(); g_pChromaSRV = nullptr; }
+                    g_pDisplayTexture->Release(); g_pDisplayTexture = nullptr;
+                    if (g_pConstantBuffer) { g_pConstantBuffer->Release(); g_pConstantBuffer = nullptr; }
+                    if (g_pVBuffer) { g_pVBuffer->Release(); g_pVBuffer = nullptr; }
+                    g_streamW = 0; // Forces mouse math to fallback
+                    g_streamH = 0;
+                }
+
+                while (!g_jitterBuffer.empty()) {
+                    AVFrame* f = g_jitterBuffer.front();
+                    g_jitterBuffer.pop();
+                    av_frame_free(&f);
+                }
+
+                firstFrameReceived = false;     // KILLS THE METRICS & HEARTBEAT LOOP!
+                g_firstPacketReceived = false;  // Resets the NACK sequence logic
+                g_expectedSeq = 0;
+                g_highestNackSent = 0;
+                g_packetStaging.clear();
+                timingStarted = false;
+                fpsCounter = 0;
+                g_packetsReceivedThisSecond = 0;
+                g_packetsLostThisSecond = 0;
+
+                float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+                if (g_pRTV) {
+                    g_pContext->ClearRenderTargetView(g_pRTV, black);
+                    g_pSwapChain->Present(1, 0);
+                }
+
+                g_firstPacketReceived = false;
+                g_packetStaging.clear();
+
+                // --- SMART SEARCH PING (Includes resolution) ---
+                if (GetTickCount() - g_lastWakePing > 1000) {
+                    char pingPacket[9];
+                    pingPacket[0] = 0xFF;
+                    memcpy(pingPacket + 1, &clientW, 4);
+                    memcpy(pingPacket + 5, &clientH, 4);
+                    sendto(inputSocket, pingPacket, 9, 0, (struct sockaddr*)&hostInputAddr, sizeof(hostInputAddr));
+
+                    g_lastWakePing = GetTickCount();
+                    // Optional: uncomment below if you want a visual heartbeat in the console
+                     std::cout << "[NET] Standby. Firing Smart Ping...\n"; 
+                }
             }
-
-            // 2. Upload and Render!
-            if (frameToRender && g_pRTV) {
-
-                // --- Upload the frame to the GPU Pipeline ---
-                if (!g_pDisplayTexture) {
-                    int streamW = frameToRender->width;
-                    int streamH = frameToRender->height;
-                    std::cout << "\n[DX11] Incoming stream detected! Building GPU pipeline for " << streamW << "x" << streamH << "...\n";
-
-                    // 1. Dynamic Texture
-                    D3D11_TEXTURE2D_DESC texDesc = { 0 };
-                    texDesc.Width = streamW;
-                    texDesc.Height = streamH;
-                    texDesc.MipLevels = 1;
-                    texDesc.ArraySize = 1;
-                    texDesc.Format = DXGI_FORMAT_NV12;
-                    texDesc.SampleDesc.Count = 1;
-                    texDesc.Usage = D3D11_USAGE_DEFAULT;
-                    texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-                    dev->CreateTexture2D(&texDesc, NULL, &g_pDisplayTexture);
-
-                    // 2. Dynamic SRVs
-                    D3D11_SHADER_RESOURCE_VIEW_DESC srvDescY = {};
-                    srvDescY.Format = DXGI_FORMAT_R8_UNORM;
-                    srvDescY.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-                    srvDescY.Texture2D.MipLevels = 1;
-                    dev->CreateShaderResourceView(g_pDisplayTexture, &srvDescY, &g_pLumaSRV);
-
-                    D3D11_SHADER_RESOURCE_VIEW_DESC srvDescUV = {};
-                    srvDescUV.Format = DXGI_FORMAT_R8G8_UNORM;
-                    srvDescUV.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-                    srvDescUV.Texture2D.MipLevels = 1;
-                    dev->CreateShaderResourceView(g_pDisplayTexture, &srvDescUV, &g_pChromaSRV);
-
-                    // 3. Dynamic Constant Buffer
-                    struct SceneBuffer { float height; float padding[3]; };
-                    SceneBuffer sb = { (float)streamH };
-                    D3D11_BUFFER_DESC cbDesc = { 0 };
-                    cbDesc.ByteWidth = sizeof(SceneBuffer);
-                    cbDesc.Usage = D3D11_USAGE_DEFAULT;
-                    cbDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-                    D3D11_SUBRESOURCE_DATA cbData = { &sb };
-                    dev->CreateBuffer(&cbDesc, &cbData, &g_pConstantBuffer);
-                    g_pContext->PSSetConstantBuffers(0, 1, &g_pConstantBuffer);
-                }
-
-                ID3D11Texture2D* hwTexture = (ID3D11Texture2D*)frameToRender->data[0];
-                UINT sliceIndex = (UINT)(uintptr_t)frameToRender->data[1];
-
-                g_pContext->CopySubresourceRegion(g_pDisplayTexture, 0, 0, 0, 0, hwTexture, sliceIndex, NULL);
-
-                // Free the FFmpeg memory immediately after we extract the DX11 texture
-                av_frame_free(&frameToRender);
-                firstFrameReceived = true;
-                fpsCounter++;
-
-                // --- Draw to the screen ---
-                float clearColor[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
-                g_pContext->ClearRenderTargetView(g_pRTV, clearColor);
-
-                g_pContext->OMSetRenderTargets(1, &g_pRTV, NULL);
-
-                ID3D11ShaderResourceView* srvs[2] = { g_pLumaSRV, g_pChromaSRV };
-                g_pContext->PSSetShaderResources(0, 2, srvs);
-
-                g_pContext->Draw(4, 0);
-
-                ID3D11ShaderResourceView* nullSRVs[2] = { nullptr, nullptr };
-                g_pContext->PSSetShaderResources(0, 2, nullSRVs);
-
-                if (g_showHUD && g_pD2DRenderTarget) {
-                    g_pD2DRenderTarget->BeginDraw();
-
-                    // 1. Math
-                    double packetLossPct = 0.0;
-                    int totalPackets = g_packetsReceivedThisSecond + g_packetsLostThisSecond;
-                    if (totalPackets > 0) packetLossPct = ((double)g_packetsLostThisSecond / totalPackets) * 100.0;
-
-                    // 2. Format the layout
-                    std::wstringstream hudText;
-                    hudText << L" FPS: " << g_displayFPS << L"\n" // <-- CHANGE fpsCounter to g_displayFPS
-                        << L" Ping: " << std::fixed << std::setprecision(1) << g_currentPingMs << L" ms\n"
-                        << L" Decode: " << std::fixed << std::setprecision(2) << clientLatencyMs << L" ms\n"
-                        << L" Loss: " << std::fixed << std::setprecision(2) << packetLossPct << L"%";
-                    std::wstring finalStr = hudText.str();
-
-                    // 3. Define the box in the top-left corner
-                    D2D1_RECT_F textRect = D2D1::RectF(20.0f, 20.0f, 300.0f, 150.0f);
-
-                    // 4. Paint!
-                    g_pD2DRenderTarget->FillRectangle(textRect, g_pBrushBackground); // Translucent backdrop
-                    g_pD2DRenderTarget->DrawTextW(
-                        finalStr.c_str(), finalStr.length(), g_pTextFormat, textRect, g_pBrushYellow
-                    ); // Yellow Text
-
-                    g_pD2DRenderTarget->EndDraw();
-                }
+            // =======================================================
+            else {
+                // =======================================================
+                // THE HOST IS ALIVE! RENDER THE STREAM NORMALLY!
                 // =======================================================
 
-                // Because we are using Flip Discard, this bypasses DWM and hits the glass instantly
-                g_pSwapChain->Present(0, 0);
+                // 1. Pull the oldest frame out of the Jitter Buffer
+                AVFrame* frameToRender = nullptr;
+                if (!g_jitterBuffer.empty()) {
+                    frameToRender = g_jitterBuffer.front();
+                    g_jitterBuffer.pop();
+                }
+
+                // 2. Upload and Render!
+                if (frameToRender && g_pRTV) {
+
+                    // --- Upload the frame to the GPU Pipeline ---
+                    if (!g_pDisplayTexture) {
+                        int streamW = frameToRender->width;
+                        int streamH = frameToRender->height;
+                        g_streamW = streamW; // <--- SAVE TO GLOBAL
+                        g_streamH = streamH; // <--- SAVE TO GLOBAL
+                        std::cout << "\n[DX11] Incoming stream detected! Building GPU pipeline for " << streamW << "x" << streamH << "...\n";
+
+                        // 1. Dynamic Texture
+                        D3D11_TEXTURE2D_DESC texDesc = { 0 };
+                        texDesc.Width = streamW;
+                        texDesc.Height = streamH;
+                        texDesc.MipLevels = 1;
+                        texDesc.ArraySize = 1;
+                        texDesc.Format = DXGI_FORMAT_NV12;
+                        texDesc.SampleDesc.Count = 1;
+                        texDesc.Usage = D3D11_USAGE_DEFAULT;
+                        texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+                        dev->CreateTexture2D(&texDesc, NULL, &g_pDisplayTexture);
+
+                        // 2. Dynamic SRVs
+                        D3D11_SHADER_RESOURCE_VIEW_DESC srvDescY = {};
+                        srvDescY.Format = DXGI_FORMAT_R8_UNORM;
+                        srvDescY.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+                        srvDescY.Texture2D.MipLevels = 1;
+                        dev->CreateShaderResourceView(g_pDisplayTexture, &srvDescY, &g_pLumaSRV);
+
+                        D3D11_SHADER_RESOURCE_VIEW_DESC srvDescUV = {};
+                        srvDescUV.Format = DXGI_FORMAT_R8G8_UNORM;
+                        srvDescUV.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+                        srvDescUV.Texture2D.MipLevels = 1;
+                        dev->CreateShaderResourceView(g_pDisplayTexture, &srvDescUV, &g_pChromaSRV);
+
+                        // 3. Dynamic Constant Buffer
+                        struct SceneBuffer { float height; float padding[3]; };
+                        SceneBuffer sb = { (float)streamH };
+                        D3D11_BUFFER_DESC cbDesc = { 0 };
+                        cbDesc.ByteWidth = sizeof(SceneBuffer);
+                        cbDesc.Usage = D3D11_USAGE_DEFAULT;
+                        cbDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+                        D3D11_SUBRESOURCE_DATA cbData = { &sb };
+                        dev->CreateBuffer(&cbDesc, &cbData, &g_pConstantBuffer);
+                        g_pContext->PSSetConstantBuffers(0, 1, &g_pConstantBuffer);
+
+                        // =======================================================
+                        // --- 4. ASPECT RATIO FIT-TO-SCREEN ---
+                        // =======================================================
+                        float streamRatio = (float)streamW / (float)streamH;
+                        float windowRatio = (float)clientW / (float)clientH;
+
+                        float scaleX = 1.0f;
+                        float scaleY = 1.0f;
+
+                        if (windowRatio > streamRatio) {
+                            // Window is wider than video -> Pillarbox (Black bars on left/right)
+                            scaleX = streamRatio / windowRatio;
+                        }
+                        else if (windowRatio < streamRatio) {
+                            // Window is taller than video -> Letterbox (Black bars on top/bottom)
+                            scaleY = windowRatio / streamRatio;
+                        }
+
+                        // Rebuild the geometry with the new math
+                        Vertex scaledVertices[] = {
+                            { -scaleX,  scaleY, 0.0f,  0.0f, 0.0f },
+                            {  scaleX,  scaleY, 0.0f,  1.0f, 0.0f },
+                            { -scaleX, -scaleY, 0.0f,  0.0f, 1.0f },
+                            {  scaleX, -scaleY, 0.0f,  1.0f, 1.0f }
+                        };
+
+                        // Destroy the old stretched geometry and load the perfect one
+                        if (g_pVBuffer) g_pVBuffer->Release();
+
+                        D3D11_BUFFER_DESC bd = { 0 };
+                        bd.ByteWidth = sizeof(scaledVertices);
+                        bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+                        D3D11_SUBRESOURCE_DATA srd = { scaledVertices };
+                        dev->CreateBuffer(&bd, &srd, &g_pVBuffer);
+
+                        // Re-bind the new shape to the renderer
+                        UINT stride = sizeof(Vertex), offset = 0;
+                        g_pContext->IASetVertexBuffers(0, 1, &g_pVBuffer, &stride, &offset);
+                    }
+
+                    ID3D11Texture2D* hwTexture = (ID3D11Texture2D*)frameToRender->data[0];
+                    UINT sliceIndex = (UINT)(uintptr_t)frameToRender->data[1];
+
+                    g_pContext->CopySubresourceRegion(g_pDisplayTexture, 0, 0, 0, 0, hwTexture, sliceIndex, NULL);
+
+                    // Free the FFmpeg memory immediately after we extract the DX11 texture
+                    av_frame_free(&frameToRender);
+                    firstFrameReceived = true;
+                    fpsCounter++;
+
+                    // --- Draw to the screen ---
+                    float clearColor[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+                    g_pContext->ClearRenderTargetView(g_pRTV, clearColor);
+
+                    g_pContext->OMSetRenderTargets(1, &g_pRTV, NULL);
+
+                    ID3D11ShaderResourceView* srvs[2] = { g_pLumaSRV, g_pChromaSRV };
+                    g_pContext->PSSetShaderResources(0, 2, srvs);
+
+                    g_pContext->Draw(4, 0);
+
+                    ID3D11ShaderResourceView* nullSRVs[2] = { nullptr, nullptr };
+                    g_pContext->PSSetShaderResources(0, 2, nullSRVs);
+
+                    if (g_showHUD && g_pD2DRenderTarget) {
+                        g_pD2DRenderTarget->BeginDraw();
+
+                        // 1. Math
+                        double packetLossPct = 0.0;
+                        int totalPackets = g_packetsReceivedThisSecond + g_packetsLostThisSecond;
+                        if (totalPackets > 0) packetLossPct = ((double)g_packetsLostThisSecond / totalPackets) * 100.0;
+
+                        // 2. Format the layout
+                        std::wstringstream hudText;
+                        hudText << L" FPS: " << g_displayFPS << L"\n"
+                            << L" Ping: " << std::fixed << std::setprecision(1) << g_currentPingMs << L" ms\n"
+                            << L" Decode: " << std::fixed << std::setprecision(2) << clientLatencyMs << L" ms\n"
+                            << L" Loss: " << std::fixed << std::setprecision(2) << packetLossPct << L"%";
+                        std::wstring finalStr = hudText.str();
+
+                        // 3. Define the box in the top-left corner
+                        D2D1_RECT_F textRect = D2D1::RectF(20.0f, 20.0f, 300.0f, 150.0f);
+
+                        // 4. Paint!
+                        g_pD2DRenderTarget->FillRectangle(textRect, g_pBrushBackground); // Translucent backdrop
+                        g_pD2DRenderTarget->DrawTextW(
+                            finalStr.c_str(), finalStr.length(), g_pTextFormat, textRect, g_pBrushYellow
+                        ); // Yellow Text
+
+                        g_pD2DRenderTarget->EndDraw();
+                    }
+
+                    // Because we are using Flip Discard, this bypasses DWM and hits the glass instantly
+                    g_pSwapChain->Present(0, 0);
+                }
             }
         }
         // =========================================================================
