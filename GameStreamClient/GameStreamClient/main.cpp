@@ -44,6 +44,8 @@ const int FRAME_HEIGHT = 1080;   // FIX: Changed from 1200 to 1080
 const int CODED_HEIGHT = 1080;   // FIX: Changed from 1200 to 1080
 const int TEXTURE_HEIGHT = 2160; // Y(1080) + U(540) + V(540)
 
+HCURSOR g_remoteCursor = NULL;
+
 bool timingStarted = false;
 LARGE_INTEGER frameStart;
 
@@ -517,7 +519,10 @@ int main() {
                 }
                 else {
                     // 2. DESKTOP MODE (Absolute Scaling)
-                    SetCursor(LoadCursor(NULL, IDC_ARROW)); // Bring the arrow back!
+
+                    // --- NEW: Use the dynamic remote cursor, or fallback to the Arrow ---
+                    SetCursor(g_remoteCursor ? g_remoteCursor : LoadCursor(NULL, IDC_ARROW));
+                    // --------------------------------------------------------------------
 
                     int scaledX = (LOWORD(msg.lParam) * 65535) / clientW;
                     int scaledY = (HIWORD(msg.lParam) * 65535) / clientH;
@@ -658,6 +663,75 @@ int main() {
 
                     // Move to the next slot in the ring buffer
                     ringIdx = (ringIdx + 1) % AUDIO_BUFFERS;
+                }
+            }
+            else if (header == 0x07) {
+                // ==========================================
+                // ROUTE 3: CURSOR SHAPE DATA
+                // ==========================================
+                uint32_t width = *(uint32_t*)(payload);
+                uint32_t height = *(uint32_t*)(payload + 4);
+                uint32_t pitch = *(uint32_t*)(payload + 8);
+                uint32_t type = *(uint32_t*)(payload + 12);
+                uint8_t* pixels = payload + 16;
+
+                HCURSOR newCursor = NULL;
+                ICONINFO ii = { 0 };
+                ii.fIcon = FALSE;
+                ii.xHotspot = 0;
+                ii.yHotspot = 0;
+
+                // --- SCENARIO A: Text I-Beams & Crosshairs (1-bit Monochrome) ---
+                if (type == 1) {
+                    // The GPU gives us the AND mask (top) and XOR mask (bottom) stacked vertically.
+                    // Windows CreateIconIndirect expects exactly this for monochrome cursors!
+                    ii.hbmMask = CreateBitmap(width, height, 1, 1, pixels);
+                    ii.hbmColor = NULL; // NULL tells Windows to treat it as Black & White
+
+                    if (ii.hbmMask) {
+                        newCursor = CreateIconIndirect(&ii);
+                        DeleteObject(ii.hbmMask);
+                    }
+                }
+                // --- SCENARIO B: Arrows & Hands (32-bit Color) ---
+                else if (type == 2 || type == 4) {
+                    // Type 2 = Standard Color. Type 4 = Masked Color (Crop the mask off the bottom).
+                    uint32_t visualHeight = (type == 4) ? (height / 2) : height;
+
+                    BITMAPINFO bmi = { 0 };
+                    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+                    bmi.bmiHeader.biWidth = width;
+                    bmi.bmiHeader.biHeight = -((int)visualHeight); // Negative means Top-Down
+                    bmi.bmiHeader.biPlanes = 1;
+                    bmi.bmiHeader.biBitCount = 32;
+                    bmi.bmiHeader.biCompression = BI_RGB;
+
+                    void* dibBits = nullptr;
+                    HBITMAP hbmColor = CreateDIBSection(NULL, &bmi, DIB_RGB_COLORS, &dibBits, NULL, 0);
+
+                    if (hbmColor) {
+                        // Copy ONLY the visual color data
+                        for (uint32_t y = 0; y < visualHeight; ++y) {
+                            memcpy((uint8_t*)dibBits + (y * width * 4), pixels + (y * pitch), width * 4);
+                        }
+
+                        // Dummy mask required for color cursors
+                        HBITMAP hbmMask = CreateBitmap(width, visualHeight, 1, 1, NULL);
+
+                        ii.hbmMask = hbmMask;
+                        ii.hbmColor = hbmColor;
+
+                        newCursor = CreateIconIndirect(&ii);
+
+                        DeleteObject(hbmColor);
+                        DeleteObject(hbmMask);
+                    }
+                }
+
+                // If we successfully built the cursor, swap it out!
+                if (newCursor) {
+                    if (g_remoteCursor) DestroyCursor(g_remoteCursor);
+                    g_remoteCursor = newCursor;
                 }
             }
         }

@@ -464,17 +464,44 @@ int main() {
             // --- THE SIMPLE RECOVERY FIX ---
             if (hr == DXGI_ERROR_ACCESS_LOST || hr == DXGI_ERROR_ACCESS_DENIED || hr == DXGI_ERROR_SESSION_DISCONNECTED) {
                 std::cout << "[DXGI] Session lost (UAC/MUX Switch). Rebooting pipeline..." << std::endl;
-                pipelineBroken = true; // This will break the inner loop
+                pipelineBroken = true;
                 continue;
             }
-            // ------------------------------------
 
             if (hr == DXGI_ERROR_WAIT_TIMEOUT) continue;
             if (FAILED(hr)) break;
 
-            // If the OS says there was no update to the image, skip encoding to save bandwidth.
+            // =========================================================================
+            // --- NEW: CURSOR SHAPE EXTRACTION (0x07) ---
+            // =========================================================================
+            if (frameInfo.PointerShapeBufferSize > 0) {
+                UINT sizeReq;
+                DXGI_OUTDUPL_POINTER_SHAPE_INFO shapeInfo;
+                std::vector<uint8_t> shapeBuffer(frameInfo.PointerShapeBufferSize);
+
+                if (SUCCEEDED(deskDupl->GetFramePointerShape(frameInfo.PointerShapeBufferSize, shapeBuffer.data(), &sizeReq, &shapeInfo))) {
+
+                    // Build Packet 0x07: [Type (1b)] [W (4b)] [H (4b)] [Pitch (4b)] [Format (4b)] [Pixels...]
+                    // A standard 32x32 ARGB cursor is exactly 4096 bytes. 
+                    // UDP's absolute size limit is 65,507 bytes. 
+                    // This means we DON'T need to write a chunker! We can blast it in one shot!
+                    std::vector<char> cursorPacket(1 + 16 + sizeReq);
+                    cursorPacket[0] = 0x07;
+                    memcpy(cursorPacket.data() + 1, &shapeInfo.Width, 4);
+                    memcpy(cursorPacket.data() + 5, &shapeInfo.Height, 4);
+                    memcpy(cursorPacket.data() + 9, &shapeInfo.Pitch, 4);
+                    memcpy(cursorPacket.data() + 13, &shapeInfo.Type, 4);
+                    memcpy(cursorPacket.data() + 17, shapeBuffer.data(), sizeReq);
+
+                    sendto(g_sendSocket, cursorPacket.data(), cursorPacket.size(), 0, (struct sockaddr*)&g_destAddr, sizeof(g_destAddr));
+
+                    std::cout << "[CURSOR] Shape Intercepted & Sent! (" << shapeInfo.Width << "x" << shapeInfo.Height << ")\n";
+                }
+            }
+            // =========================================================================
+
             if (frameInfo.LastPresentTime.QuadPart == 0) {
-                desktopResource->Release();
+                if (desktopResource) desktopResource->Release(); // <--- FIX: Prevent Null Pointer Crash!
                 deskDupl->ReleaseFrame();
                 continue;
             }
