@@ -21,6 +21,7 @@
 #include <opus/opus.h>
 #include <xaudio2.h>
 #include <queue>
+#include <map>
 
 
 extern "C" {
@@ -74,8 +75,12 @@ ID3D11Buffer* g_pVBuffer = nullptr;
 ID3D11SamplerState* g_pSampler = nullptr;
 
 std::queue<AVFrame*> g_jitterBuffer;
-const int MAX_BUFFER_SIZE = 2; // Strict 2-frame limit for extreme low latency
-LARGE_INTEGER g_frameTimer;    // The Metronome
+const int MAX_BUFFER_SIZE = 2;
+LARGE_INTEGER g_frameTimer;
+
+std::map<uint32_t, std::vector<uint8_t>> g_packetStaging;
+uint32_t g_expectedSeq = 0;
+bool g_firstPacketReceived = false;
 
 // ============================================================
 // DIAGNOSTIC HELPERS
@@ -483,6 +488,32 @@ int main() {
     std::cout << "  HOTKEY: Press [ F8 ] to Toggle Game Mode\n";
     std::cout << "=================================================\n\n";
 
+    auto DecodeVideoPacket = [&](uint8_t* data, int size) {
+        while (size > 0) {
+            int ret = av_parser_parse2(parser, codec_ctx, &pkt->data, &pkt->size,
+                data, size, AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0);
+            data += ret;
+            size -= ret;
+
+            if (pkt->size) {
+                if (avcodec_send_packet(codec_ctx, pkt) == 0) {
+                    while (avcodec_receive_frame(codec_ctx, frame) == 0) {
+                        AVFrame* queuedFrame = av_frame_alloc();
+                        av_frame_move_ref(queuedFrame, frame);
+                        g_jitterBuffer.push(queuedFrame);
+
+                        if (g_jitterBuffer.size() > MAX_BUFFER_SIZE) {
+                            AVFrame* droppedFrame = g_jitterBuffer.front();
+                            g_jitterBuffer.pop();
+                            av_frame_free(&droppedFrame);
+                        }
+                    }
+                }
+                av_packet_unref(pkt);
+            }
+        }
+        };
+
     while (running) {
         MSG msg;
         while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
@@ -599,45 +630,62 @@ int main() {
 
             if (header == 0x01) {
                 // ==========================================
-                // ROUTE 1: VIDEO DATA
+                // ROUTE 1: STAMPED VIDEO DATA & NACK REASSEMBLY
                 // ==========================================
                 if (!timingStarted) {
                     QueryPerformanceCounter(&frameStart);
                     timingStarted = true;
                 }
 
-                while (payloadSize > 0) {
-                    int ret = av_parser_parse2(parser, codec_ctx, &pkt->data, &pkt->size,
-                        payload, payloadSize, AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0);
-                    payload += ret;
-                    payloadSize -= ret;
+                // 1. Unpack our new custom protocol
+                uint32_t seq = *(uint32_t*)(payload);
+                uint8_t* videoData = payload + 4;
+                int videoSize = payloadSize - 4;
 
-                    if (pkt->size) {
-                        // Send packet to FFmpeg Decoder
-                        // Send packet to FFmpeg Decoder
-                        if (avcodec_send_packet(codec_ctx, pkt) == 0) {
+                if (!g_firstPacketReceived) {
+                    g_expectedSeq = seq;
+                    g_firstPacketReceived = true;
+                }
 
-                            // Drain all available frames
-                            while (avcodec_receive_frame(codec_ctx, frame) == 0) {
+                if (seq == g_expectedSeq) {
+                    // --- SCENARIO A: Perfect Order ---
+                    DecodeVideoPacket(videoData, videoSize);
+                    g_expectedSeq++;
 
-                                // 1. Clone the hardware reference 
-                                AVFrame* queuedFrame = av_frame_alloc();
-                                av_frame_move_ref(queuedFrame, frame);
-
-                                // 2. Push it into the Waiting Room
-                                g_jitterBuffer.push(queuedFrame);
-
-                                // 3. THE LATENCY SAVIOR (Drop-Head Optimization)
-                                if (g_jitterBuffer.size() > MAX_BUFFER_SIZE) {
-                                    AVFrame* droppedFrame = g_jitterBuffer.front();
-                                    g_jitterBuffer.pop();
-                                    av_frame_free(&droppedFrame);
-                                }
-                            }
-                        }
-                        av_packet_unref(pkt);
+                    // Drain the staging area! Did the missing packets arrive?
+                    while (g_packetStaging.count(g_expectedSeq)) {
+                        DecodeVideoPacket(g_packetStaging[g_expectedSeq].data(), g_packetStaging[g_expectedSeq].size());
+                        g_packetStaging.erase(g_expectedSeq);
+                        g_expectedSeq++;
                     }
                 }
+                else if (seq > g_expectedSeq) {
+                    // --- SCENARIO B: WE MISSED A PACKET! ---
+
+                    // 1. Store this "packet from the future" safely
+                    g_packetStaging[seq] = std::vector<uint8_t>(videoData, videoData + videoSize);
+
+                    // 2. Scream for help (Send NACKs for the gap)
+                    for (uint32_t missing = g_expectedSeq; missing < seq; ++missing) {
+                        if (g_packetStaging.find(missing) == g_packetStaging.end()) {
+                            char nackPacket[5];
+                            nackPacket[0] = 0x08; // NACK Header
+                            memcpy(nackPacket + 1, &missing, 4);
+                            sendto(inputSocket, nackPacket, 5, 0, (struct sockaddr*)&hostInputAddr, sizeof(hostInputAddr));
+                            std::cout << "[NET] Packet gap detected! Sent NACK for Seq: " << missing << "\n";
+                        }
+                    }
+
+                    // 3. Safety Valve: If we are hopelessly desynced (e.g., massive ping spike), reset.
+                    if (g_packetStaging.size() > 60) {
+                        std::cout << "[NET] Hopelessly desynced. Hard resetting sequence.\n";
+                        g_packetStaging.clear();
+                        g_expectedSeq = seq + 1;
+                        DecodeVideoPacket(videoData, videoSize);
+                    }
+                }
+                // --- SCENARIO C: seq < g_expectedSeq ---
+                // It's a duplicate or arrived too late. We already moved on. Do nothing!
             }
             else if (header == 0x02) {
                 // ==========================================

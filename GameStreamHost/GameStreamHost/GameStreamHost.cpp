@@ -35,6 +35,14 @@ sockaddr_in g_destAddr;
 
 SOCKET g_inputRecvSocket;
 
+struct PacketRecord {
+    uint32_t seq;
+    int size;
+    char data[1500]; // Max UDP payload size
+};
+std::vector<PacketRecord> g_packetHistory(1024); // Ring buffer of the last 1024 packets
+uint32_t g_sequenceCounter = 0;
+
 BOOL WINAPI ConsoleHandler(DWORD signal) {
     if (signal == CTRL_CLOSE_EVENT || signal == CTRL_C_EVENT) {
         std::cout << "\n[SYSTEM] Shutdown signal received. Cleaning up..." << std::endl;
@@ -201,6 +209,22 @@ void InputInjectionThread() {
             uint8_t type = buf[0];
 
             if (type == 0xFF) continue; // Ignore the ping packet, we just needed it for the IP!
+
+            // =======================================================
+            // --- NEW: CATCH NACK REQUESTS ---
+            // =======================================================
+            if (type == 0x08) {
+                uint32_t missingSeq = *(uint32_t*)(buf + 1);
+                int idx = missingSeq % 1024; // Find where it lives in the ring buffer
+
+                // Sanity check: Ensure the history hasn't overwritten it yet
+                if (g_packetHistory[idx].seq == missingSeq) {
+                    sendto(g_sendSocket, g_packetHistory[idx].data, g_packetHistory[idx].size, 0, (struct sockaddr*)&g_destAddr, sizeof(g_destAddr));
+                    std::cout << "[NACK] Rescued dropped packet: " << missingSeq << "\n";
+                }
+                continue; // We are done, skip the mouse/keyboard checks
+            }
+            // =======================================================
 
             if (type == 0x03) { // MOUSE MOVE (Absolute)
                 // FIX: Read the incoming bytes as Integers!
@@ -586,20 +610,27 @@ int main() {
                     while (bytesRemaining > 0) {
                         int payloadSize = (bytesRemaining > CHUNK_SIZE) ? CHUNK_SIZE : bytesRemaining;
 
-                        // NEW: Create a packet with 1 extra byte for the header
-                        std::vector<char> packet(payloadSize + 1);
-                        packet[0] = 0x01; // 0x01 = VIDEO DATA
-                        memcpy(packet.data() + 1, dataPtr + offset, payloadSize);
+                        // NEW CUSTOM PROTOCOL: [0x01] [SEQ (4b)] [Payload...]
+                        std::vector<char> packet(1 + 4 + payloadSize);
+                        packet[0] = 0x01;
+                        memcpy(packet.data() + 1, &g_sequenceCounter, 4); // Stamp it!
+                        memcpy(packet.data() + 5, dataPtr + offset, payloadSize);
 
-                        // Send the multiplexed packet
+                        // 1. Save a copy to the History Bank FIRST
+                        int idx = g_sequenceCounter % 1024;
+                        g_packetHistory[idx].seq = g_sequenceCounter;
+                        g_packetHistory[idx].size = packet.size();
+                        memcpy(g_packetHistory[idx].data, packet.data(), packet.size());
+
+                        // 2. Fire it over the network
                         sendto(g_sendSocket, packet.data(), packet.size(), 0, (struct sockaddr*)&g_destAddr, sizeof(g_destAddr));
 
+                        g_sequenceCounter++; // Increment the master stamper
                         offset += payloadSize;
                         bytesRemaining -= payloadSize;
 
                         if (offset % (CHUNK_SIZE * 2) == 0) Sleep(0);
                     }
-                    // ------------------------------------------
 
                     if (framesCaptured % 60 == 0) {
                         std::cout << "Streaming (UDP)... Frame " << framesCaptured << std::endl;
