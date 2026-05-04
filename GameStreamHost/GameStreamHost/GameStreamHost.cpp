@@ -224,6 +224,11 @@ void InputInjectionThread() {
                 }
                 continue; // We are done, skip the mouse/keyboard checks
             }
+            else if (type == 0x09) {
+                // Bounce the exact same packet back to the Client!
+                sendto(g_sendSocket, buf, bytes, 0, (struct sockaddr*)&g_destAddr, sizeof(g_destAddr));
+                continue;
+            }
             // =======================================================
 
             if (type == 0x03) { // MOUSE MOVE (Absolute)
@@ -621,6 +626,14 @@ int main() {
                         g_packetHistory[idx].seq = g_sequenceCounter;
                         g_packetHistory[idx].size = packet.size();
                         memcpy(g_packetHistory[idx].data, packet.data(), packet.size());
+
+                        // --- CHAOS MONKEY: Artificially drop 5% of packets! ---
+                        if (rand() % 100 < 5) {
+                            g_sequenceCounter++;
+                            offset += payloadSize;
+                            bytesRemaining -= payloadSize;
+                            continue; // Skip the sendto!
+                        }
 
                         // 2. Fire it over the network
                         sendto(g_sendSocket, packet.data(), packet.size(), 0, (struct sockaddr*)&g_destAddr, sizeof(g_destAddr));

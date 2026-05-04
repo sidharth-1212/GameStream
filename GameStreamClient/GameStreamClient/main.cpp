@@ -23,6 +23,8 @@
 #include <queue>
 #include <map>
 
+#include <d2d1.h>
+#include <dwrite.h>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -36,6 +38,8 @@ extern "C" {
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "winmm.lib")
+#pragma comment(lib, "d2d1.lib")
+#pragma comment(lib, "dwrite.lib")
 
 extern "C" {
     __declspec(dllexport) DWORD NvOptimusEnablement = 0x00000001;
@@ -48,6 +52,18 @@ const int CODED_HEIGHT = 1080;   // FIX: Changed from 1200 to 1080
 const int TEXTURE_HEIGHT = 2160; // Y(1080) + U(540) + V(540)
 
 HCURSOR g_remoteCursor = NULL;
+
+// ==========================================
+// --- NEW: DIRECT2D HUD GLOBALS ---
+// ==========================================
+ID2D1Factory* g_pD2DFactory = nullptr;
+ID2D1RenderTarget* g_pD2DRenderTarget = nullptr;
+IDWriteFactory* g_pDWriteFactory = nullptr;
+IDWriteTextFormat* g_pTextFormat = nullptr;
+ID2D1SolidColorBrush* g_pBrushYellow = nullptr;
+ID2D1SolidColorBrush* g_pBrushBackground = nullptr;
+bool g_showHUD = true; // Toggle with F9
+// ==========================================
 
 bool timingStarted = false;
 LARGE_INTEGER frameStart;
@@ -81,6 +97,12 @@ LARGE_INTEGER g_frameTimer;
 std::map<uint32_t, std::vector<uint8_t>> g_packetStaging;
 uint32_t g_expectedSeq = 0;
 bool g_firstPacketReceived = false;
+uint32_t g_highestNackSent = 0;
+
+int g_packetsReceivedThisSecond = 0;
+int g_packetsLostThisSecond = 0;
+double g_currentPingMs = 0.0;
+int g_displayFPS = 0;
 
 // ============================================================
 // DIAGNOSTIC HELPERS
@@ -288,9 +310,11 @@ int main() {
     scd.Windowed = TRUE;
     scd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
 
+    UINT createDeviceFlags = D3D11_CREATE_DEVICE_BGRA_SUPPORT; // Crucial for Direct2D!
+    
     ID3D11Device* dev = nullptr;
     HRESULT hrDev = D3D11CreateDeviceAndSwapChain(
-        NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, NULL, 0, D3D11_SDK_VERSION,
+        NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, createDeviceFlags, NULL, 0, D3D11_SDK_VERSION,
         &scd, &g_pSwapChain, &dev, NULL, &g_pContext);
     std::cout << "[DX11] D3D11CreateDeviceAndSwapChain: 0x" << std::hex << hrDev << std::dec << "\n";
 
@@ -311,7 +335,35 @@ int main() {
     dev->CreateRasterizerState(&rd, &rs);
     g_pContext->RSSetState(rs);
 
-    
+    // =======================================================
+    // --- NEW: DIRECT2D OVERLAY INITIALIZATION ---
+    // =======================================================
+    D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &g_pD2DFactory);
+    DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory), (IUnknown**)&g_pDWriteFactory);
+
+    // Create a nice, readable font (Consolas looks very "terminal/hacker")
+    g_pDWriteFactory->CreateTextFormat(
+        L"Consolas", NULL, DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+        24.0f, L"en-us", &g_pTextFormat
+    );
+
+    // Extract the raw glass surface from the SwapChain
+    IDXGISurface* pBackBuffer = nullptr;
+    g_pSwapChain->GetBuffer(0, __uuidof(IDXGISurface), (void**)&pBackBuffer);
+
+    D2D1_RENDER_TARGET_PROPERTIES props = D2D1::RenderTargetProperties(
+        D2D1_RENDER_TARGET_TYPE_DEFAULT,
+        D2D1::PixelFormat(DXGI_FORMAT_UNKNOWN, D2D1_ALPHA_MODE_PREMULTIPLIED)
+    );
+
+    // Bind Direct2D to the DirectX 11 screen
+    g_pD2DFactory->CreateDxgiSurfaceRenderTarget(pBackBuffer, &props, &g_pD2DRenderTarget);
+    pBackBuffer->Release();
+
+    // Create our paint colors
+    g_pD2DRenderTarget->CreateSolidColorBrush(D2D1::ColorF(D2D1::ColorF::Yellow), &g_pBrushYellow);
+    g_pD2DRenderTarget->CreateSolidColorBrush(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.6f), &g_pBrushBackground); // Dark translucent box
+    // =======================================================
 
     // 1. Luma SRV (Y Plane - mapped to t0 in shader)
     D3D11_SHADER_RESOURCE_VIEW_DESC srvDescY = {};
@@ -549,6 +601,11 @@ int main() {
                 }
                 continue; // Do NOT send F8 to the Host PC
             }
+            else if ((msg.message == WM_KEYDOWN || msg.message == WM_SYSKEYDOWN) && msg.wParam == VK_F9) {
+                if ((msg.lParam & (1 << 30)) == 0) { // Prevent holding down auto-repeat
+                    g_showHUD = !g_showHUD;
+                }
+            }
 
             // --- MOUSE CLICKS (Always Active) ---
             else if (msg.message == WM_LBUTTONDOWN || msg.message == WM_LBUTTONUP ||
@@ -632,6 +689,8 @@ int main() {
                 // ==========================================
                 // ROUTE 1: STAMPED VIDEO DATA & NACK REASSEMBLY
                 // ==========================================
+                g_packetsReceivedThisSecond++; // <-- FIX 1: PLUG IN THE SENSOR!
+
                 if (!timingStarted) {
                     QueryPerformanceCounter(&frameStart);
                     timingStarted = true;
@@ -665,27 +724,40 @@ int main() {
                     // 1. Store this "packet from the future" safely
                     g_packetStaging[seq] = std::vector<uint8_t>(videoData, videoData + videoSize);
 
-                    // 2. Scream for help (Send NACKs for the gap)
-                    for (uint32_t missing = g_expectedSeq; missing < seq; ++missing) {
+                    // 2. Scream for help (BUT NO SPAMMING!)
+                    // Only NACK packets we haven't already screamed about
+                    uint32_t startNack = (g_highestNackSent > g_expectedSeq) ? g_highestNackSent + 1 : g_expectedSeq;
+
+                    for (uint32_t missing = startNack; missing < seq; ++missing) {
                         if (g_packetStaging.find(missing) == g_packetStaging.end()) {
                             char nackPacket[5];
-                            nackPacket[0] = 0x08; // NACK Header
+                            nackPacket[0] = 0x08;
                             memcpy(nackPacket + 1, &missing, 4);
                             sendto(inputSocket, nackPacket, 5, 0, (struct sockaddr*)&hostInputAddr, sizeof(hostInputAddr));
-                            std::cout << "[NET] Packet gap detected! Sent NACK for Seq: " << missing << "\n";
+
+                            g_packetsLostThisSecond++; // <-- FIX 2: LOG THE LOSS!
+                            g_highestNackSent = missing; // Update the high-water mark
                         }
                     }
 
-                    // 3. Safety Valve: If we are hopelessly desynced (e.g., massive ping spike), reset.
-                    if (g_packetStaging.size() > 60) {
+                    // 3. Safety Valve: Raise the limit to 500! (~700ms of safety)
+                    if (g_packetStaging.size() > 500) {
                         std::cout << "[NET] Hopelessly desynced. Hard resetting sequence.\n";
                         g_packetStaging.clear();
                         g_expectedSeq = seq + 1;
                         DecodeVideoPacket(videoData, videoSize);
                     }
                 }
+
                 // --- SCENARIO C: seq < g_expectedSeq ---
                 // It's a duplicate or arrived too late. We already moved on. Do nothing!
+
+                if (timingStarted) {
+                    LARGE_INTEGER decodeEnd;
+                    QueryPerformanceCounter(&decodeEnd);
+                    clientLatencyMs = ((double)(decodeEnd.QuadPart - frameStart.QuadPart) * 1000.0) / timerFreq.QuadPart;
+                    timingStarted = false;
+                }
             }
             else if (header == 0x02) {
                 // ==========================================
@@ -775,6 +847,16 @@ int main() {
                     g_remoteCursor = newCursor;
                 }
             }
+            else if (header == 0x09) {
+                LARGE_INTEGER currentTime;
+                QueryPerformanceCounter(&currentTime);
+
+                LARGE_INTEGER sentTime;
+                memcpy(&sentTime.QuadPart, payload, 8); // Extract the timestamp we sent
+
+                // Calculate the Round Trip Time (RTT)
+                g_currentPingMs = ((double)(currentTime.QuadPart - sentTime.QuadPart) * 1000.0) / timerFreq.QuadPart;
+            }
         }
 
         // Upload new frame from FFmpeg (always on main thread)
@@ -859,6 +941,7 @@ int main() {
                 // Free the FFmpeg memory immediately after we extract the DX11 texture
                 av_frame_free(&frameToRender);
                 firstFrameReceived = true;
+                fpsCounter++;
 
                 // --- Draw to the screen ---
                 float clearColor[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
@@ -873,6 +956,35 @@ int main() {
 
                 ID3D11ShaderResourceView* nullSRVs[2] = { nullptr, nullptr };
                 g_pContext->PSSetShaderResources(0, 2, nullSRVs);
+
+                if (g_showHUD && g_pD2DRenderTarget) {
+                    g_pD2DRenderTarget->BeginDraw();
+
+                    // 1. Math
+                    double packetLossPct = 0.0;
+                    int totalPackets = g_packetsReceivedThisSecond + g_packetsLostThisSecond;
+                    if (totalPackets > 0) packetLossPct = ((double)g_packetsLostThisSecond / totalPackets) * 100.0;
+
+                    // 2. Format the layout
+                    std::wstringstream hudText;
+                    hudText << L" FPS: " << g_displayFPS << L"\n" // <-- CHANGE fpsCounter to g_displayFPS
+                        << L" Ping: " << std::fixed << std::setprecision(1) << g_currentPingMs << L" ms\n"
+                        << L" Decode: " << std::fixed << std::setprecision(2) << clientLatencyMs << L" ms\n"
+                        << L" Loss: " << std::fixed << std::setprecision(2) << packetLossPct << L"%";
+                    std::wstring finalStr = hudText.str();
+
+                    // 3. Define the box in the top-left corner
+                    D2D1_RECT_F textRect = D2D1::RectF(20.0f, 20.0f, 300.0f, 150.0f);
+
+                    // 4. Paint!
+                    g_pD2DRenderTarget->FillRectangle(textRect, g_pBrushBackground); // Translucent backdrop
+                    g_pD2DRenderTarget->DrawTextW(
+                        finalStr.c_str(), finalStr.length(), g_pTextFormat, textRect, g_pBrushYellow
+                    ); // Yellow Text
+
+                    g_pD2DRenderTarget->EndDraw();
+                }
+                // =======================================================
 
                 // Because we are using Flip Discard, this bypasses DWM and hits the glass instantly
                 g_pSwapChain->Present(0, 0);
@@ -889,13 +1001,33 @@ int main() {
 
             // Update Window Title once per second
             if ((frameEnd.QuadPart - secondTimer.QuadPart) >= timerFreq.QuadPart) {
-                std::wstringstream title;
-                title << L"GameStream Client | Video FPS: " << fpsCounter
-                    << L" | Decode+Render Latency: " << std::fixed << std::setprecision(2) << clientLatencyMs << L" ms";
 
-                SetWindowText(hWnd, title.str().c_str());
+                // 1. Calculate Packet Loss %
+                double packetLossPct = 0.0;
+                int totalPackets = g_packetsReceivedThisSecond + g_packetsLostThisSecond;
+                if (totalPackets > 0) {
+                    packetLossPct = ((double)g_packetsLostThisSecond / totalPackets) * 100.0;
+                }
 
-                fpsCounter = 0; // Reset for the next second
+                // 2. Print to Console
+                std::cout << "[METRICS] FPS: " << std::setw(2) << fpsCounter
+                    << " | Ping: " << std::fixed << std::setprecision(1) << std::setw(4) << g_currentPingMs << " ms"
+                    << " | Decode Latency: " << std::setw(4) << clientLatencyMs << " ms"
+                    << " | Packet Loss: " << packetLossPct << "%\n";
+
+                // 3. Fire the next Heartbeat
+                LARGE_INTEGER pingTime;
+                QueryPerformanceCounter(&pingTime);
+                char pingPacket[9];
+                pingPacket[0] = 0x09;
+                memcpy(pingPacket + 1, &pingTime.QuadPart, 8);
+                sendto(inputSocket, pingPacket, 9, 0, (struct sockaddr*)&hostInputAddr, sizeof(hostInputAddr));
+
+                // 4. Reset for the next second
+                g_displayFPS = fpsCounter;
+                fpsCounter = 0;
+                g_packetsReceivedThisSecond = 0;
+                g_packetsLostThisSecond = 0;
                 secondTimer = frameEnd;
             }
         }
