@@ -30,6 +30,17 @@
 std::atomic<bool> g_running{ true };
 std::atomic<bool> g_clientConnected{ false }; // <-- ADD THIS
 
+// =======================================================
+// --- NEW: DYNAMIC BITRATE GLOBALS ---
+// =======================================================
+std::atomic<uint32_t> g_targetBitrate{ 8000000 };      // Start at 8 Mbps
+std::atomic<bool> g_bitrateChangeRequested{ false };
+
+// We MUST store these globally so the Reconfigure API can read them safely
+NV_ENC_INITIALIZE_PARAMS g_nvencInitParams = { NV_ENC_INITIALIZE_PARAMS_VER };
+NV_ENC_CONFIG g_nvencConfig = { NV_ENC_CONFIG_VER };
+// =======================================================
+
 SOCKET g_sendSocket;
 sockaddr_in g_destAddr;
 
@@ -229,6 +240,17 @@ void InputInjectionThread() {
                 sendto(g_sendSocket, buf, bytes, 0, (struct sockaddr*)&g_destAddr, sizeof(g_destAddr));
                 continue;
             }
+            else if (type == 0x0A) {
+                uint32_t requestedBitrate = *(uint32_t*)(buf + 1);
+
+                // Only trigger a reconfigure if the bitrate actually changed
+                if (requestedBitrate != g_targetBitrate.load()) {
+                    g_targetBitrate.store(requestedBitrate);
+                    g_bitrateChangeRequested.store(true);
+                    std::cout << "[NET] Client requested gear shift to: " << (requestedBitrate / 1000000) << " Mbps\n";
+                }
+                continue;
+            }
             // =======================================================
 
             if (type == 0x03) { // MOUSE MOVE (Absolute)
@@ -265,8 +287,17 @@ void InputInjectionThread() {
 
                 INPUT input = { 0 };
                 input.type = INPUT_KEYBOARD;
-                input.ki.wVk = vk;
-                input.ki.dwFlags = isDown ? 0 : KEYEVENTF_KEYUP;
+
+                // =======================================================
+                // --- THE DIRECTINPUT GAME FIX ---
+                // =======================================================
+                // 1. Translate the Virtual Key into a physical Hardware Scan Code
+                input.ki.wScan = MapVirtualKey(vk, MAPVK_VK_TO_VSC);
+                input.ki.wVk = vk; // Keep the VK as a backup for standard Windows apps
+
+                // 2. Explicitly tell the OS we are injecting a raw hardware scan code!
+                input.ki.dwFlags = KEYEVENTF_SCANCODE | (isDown ? 0 : KEYEVENTF_KEYUP);
+
                 SendInput(1, &input, sizeof(INPUT));
             }
             else if (type == 0x06) { // RELATIVE MOVE
@@ -279,6 +310,15 @@ void InputInjectionThread() {
                 input.mi.dwFlags = MOUSEEVENTF_MOVE;
                 input.mi.dx = dx;
                 input.mi.dy = dy;
+                SendInput(1, &input, sizeof(INPUT));
+            }
+            else if (type == 0x0B) {
+                int wheelDelta = *(int*)(buf + 1);
+
+                INPUT input = { 0 };
+                input.type = INPUT_MOUSE;
+                input.mi.dwFlags = MOUSEEVENTF_WHEEL;
+                input.mi.mouseData = wheelDelta;
                 SendInput(1, &input, sizeof(INPUT));
             }
         }
@@ -418,50 +458,43 @@ int main() {
             return 1;
         }
 
-        NV_ENC_INITIALIZE_PARAMS initParams = { NV_ENC_INITIALIZE_PARAMS_VER };
+        g_nvencInitParams = { NV_ENC_INITIALIZE_PARAMS_VER };
         GUID encodeGUID = NV_ENC_CODEC_H264_GUID;
         GUID presetGUID = NV_ENC_PRESET_P3_GUID;
-        initParams.tuningInfo = NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY;
+        g_nvencInitParams.tuningInfo = NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY;
 
         NV_ENC_PRESET_CONFIG presetConfig = { NV_ENC_PRESET_CONFIG_VER };
         presetConfig.presetCfg.version = NV_ENC_CONFIG_VER;
         nvenc.nvEncGetEncodePresetConfigEx(encoderSession, encodeGUID, presetGUID,
-            initParams.tuningInfo, &presetConfig);
+            g_nvencInitParams.tuningInfo, &presetConfig);
 
-        NV_ENC_CONFIG encodeConfig = presetConfig.presetCfg;
-        initParams.encodeConfig = &encodeConfig;
-        initParams.encodeGUID = encodeGUID;
-        initParams.presetGUID = presetGUID;
-        initParams.encodeWidth = activeWidth;
-        initParams.encodeHeight = activeHeight;
+        // Copy the preset into our GLOBAL config, and link it to our GLOBAL init params
+        g_nvencConfig = presetConfig.presetCfg;
+        g_nvencInitParams.encodeConfig = &g_nvencConfig;
 
+        g_nvencInitParams.encodeGUID = encodeGUID;
+        g_nvencInitParams.presetGUID = presetGUID;
+        g_nvencInitParams.encodeWidth = activeWidth;
+        g_nvencInitParams.encodeHeight = activeHeight;
+        g_nvencInitParams.frameRateNum = 60;
+        g_nvencInitParams.frameRateDen = 1;
+        g_nvencInitParams.enablePTD = 1;
 
-        initParams.frameRateNum = 60;
-        initParams.frameRateDen = 1;
-        initParams.enablePTD = 1;
-        encodeConfig.gopLength = 60;
-        encodeConfig.encodeCodecConfig.h264Config.idrPeriod = 60;
+        g_nvencConfig.gopLength = 60;
+        g_nvencConfig.encodeCodecConfig.h264Config.idrPeriod = 60;
+        g_nvencConfig.encodeCodecConfig.h264Config.enableIntraRefresh = 0;
+        g_nvencConfig.encodeCodecConfig.h264Config.intraRefreshPeriod = 30;
+        g_nvencConfig.encodeCodecConfig.h264Config.intraRefreshCnt = 1;
+        g_nvencConfig.encodeCodecConfig.h264Config.repeatSPSPPS = 1;
 
-        // Refresh 1/30th of the screen every frame
-        encodeConfig.encodeCodecConfig.h264Config.enableIntraRefresh = 0;
-        encodeConfig.encodeCodecConfig.h264Config.intraRefreshPeriod = 30;
-        encodeConfig.encodeCodecConfig.h264Config.intraRefreshCnt = 1;
+        // Start at our global target (8 Mbps)
+        g_nvencConfig.rcParams.averageBitRate = g_targetBitrate.load();
+        g_nvencConfig.rcParams.maxBitRate = g_targetBitrate.load() + 2000000;
+        g_nvencConfig.rcParams.vbvBufferSize = g_targetBitrate.load() + 2000000;
+        g_nvencConfig.rcParams.enableAQ = 1;
 
-        // Send headers with EVERY frame so the client never gets lost
-        encodeConfig.encodeCodecConfig.h264Config.repeatSPSPPS = 1;
-
-        // Lower the bitrate slightly for stability while testing loopback
-        encodeConfig.rcParams.averageBitRate = 8000000;
-        encodeConfig.rcParams.maxBitRate = 12000000;
-
-        // The VBV Buffer is the "bank" NVENC draws from during alt-tabs.
-        // Set it to hold exactly 1 second of maximum data.
-        encodeConfig.rcParams.vbvBufferSize = 12000000;
-
-        encodeConfig.rcParams.enableAQ = 1;
-
-        nvenc.nvEncInitializeEncoder(encoderSession, &initParams);
-        std::cout << "NVENC encoder initialized." << std::endl;
+        nvenc.nvEncInitializeEncoder(encoderSession, &g_nvencInitParams);
+        std::cout << "NVENC encoder initialized with Dynamic Config." << std::endl;
 
         NV_ENC_CREATE_BITSTREAM_BUFFER bitstreamBuffer = { NV_ENC_CREATE_BITSTREAM_BUFFER_VER };
         nvenc.nvEncCreateBitstreamBuffer(encoderSession, &bitstreamBuffer);
@@ -598,6 +631,29 @@ int main() {
             picParams.outputBitstream = bitstreamBuffer.bitstreamBuffer;
             picParams.bufferFmt = nvencFormat;
             picParams.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
+
+            if (g_bitrateChangeRequested.exchange(false)) {
+                NV_ENC_RECONFIGURE_PARAMS reconfigParams = { NV_ENC_RECONFIGURE_PARAMS_VER };
+
+                // Update the global config with the new requested bitrate
+                g_nvencConfig.rcParams.averageBitRate = g_targetBitrate.load();
+                g_nvencConfig.rcParams.maxBitRate = g_targetBitrate.load() + 2000000;
+                g_nvencConfig.rcParams.vbvBufferSize = g_targetBitrate.load() + 2000000;
+
+                // Pass the updated global params into the reconfigurator
+                reconfigParams.reInitEncodeParams = g_nvencInitParams;
+                reconfigParams.resetEncoder = 1; // Force an IDR frame to clear visual artifacts
+                reconfigParams.forceIDR = 1;
+
+                NVENCSTATUS status = nvenc.nvEncReconfigureEncoder(encoderSession, &reconfigParams);
+                if (status == NV_ENC_SUCCESS) {
+                    std::cout << "[ENCODER] Successfully shifted gears to " << (g_targetBitrate.load() / 1000000) << " Mbps!\n";
+                }
+                else {
+                    std::cerr << "[ENCODER] Reconfiguration FAILED! Error: " << status << "\n";
+                }
+            }
+            // =========================================================================
 
             if (nvenc.nvEncEncodePicture(encoderSession, &picParams) == NV_ENC_SUCCESS) {
                 NV_ENC_LOCK_BITSTREAM lockParams = { NV_ENC_LOCK_BITSTREAM_VER };

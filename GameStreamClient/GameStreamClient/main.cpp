@@ -54,6 +54,15 @@ const int TEXTURE_HEIGHT = 2160; // Y(1080) + U(540) + V(540)
 HCURSOR g_remoteCursor = NULL;
 
 // ==========================================
+// --- NEW: DYNAMIC BITRATE GLOBALS ---
+// ==========================================
+const uint32_t BITRATE_HIGH = 8000000; // 8 Mbps (Crisp & Clear)
+const uint32_t BITRATE_LOW = 3000000; // 3 Mbps (Blurry but Fast)
+uint32_t g_currentBitrate = BITRATE_HIGH;
+int g_bitrateCooldown = 0; // The 5-second lock
+// ==========================================
+
+// ==========================================
 // --- NEW: DIRECT2D HUD GLOBALS ---
 // ==========================================
 ID2D1Factory* g_pD2DFactory = nullptr;
@@ -619,6 +628,16 @@ int main() {
                 packet[2] = isDown;
                 sendto(inputSocket, packet, 3, 0, (struct sockaddr*)&hostInputAddr, sizeof(hostInputAddr));
             }
+            else if (msg.message == WM_MOUSEWHEEL) {
+                // GET_WHEEL_DELTA_WPARAM extracts the scroll direction and distance
+                // Positive = Scroll Up, Negative = Scroll Down
+                int wheelDelta = GET_WHEEL_DELTA_WPARAM(msg.wParam);
+
+                char packet[5];
+                packet[0] = 0x0B;
+                memcpy(packet + 1, &wheelDelta, 4);
+                sendto(inputSocket, packet, 5, 0, (struct sockaddr*)&hostInputAddr, sizeof(hostInputAddr));
+            }
 
             // --- MOUSE MOVEMENT (Split Logic) ---
             else if (msg.message == WM_MOUSEMOVE) {
@@ -1014,6 +1033,40 @@ int main() {
                     << " | Ping: " << std::fixed << std::setprecision(1) << std::setw(4) << g_currentPingMs << " ms"
                     << " | Decode Latency: " << std::setw(4) << clientLatencyMs << " ms"
                     << " | Packet Loss: " << packetLossPct << "%\n";
+
+                if (g_bitrateCooldown > 0) {
+                    g_bitrateCooldown--; // Tick down the lock
+                }
+                else {
+                    // Define our thresholds
+                    bool networkIsStruggling = (packetLossPct > 2.0 || g_currentPingMs > 60.0);
+                    bool networkIsPerfect = (packetLossPct == 0.0 && g_currentPingMs < 30.0);
+
+                    if (networkIsStruggling && g_currentBitrate == BITRATE_HIGH) {
+                        // SHIFT DOWN! (Emergency survival mode)
+                        g_currentBitrate = BITRATE_LOW;
+                        g_bitrateCooldown = 5; // Lock it for 5 seconds to let the router breathe
+
+                        char shiftPacket[5];
+                        shiftPacket[0] = 0x0A;
+                        memcpy(shiftPacket + 1, &g_currentBitrate, 4);
+                        sendto(inputSocket, shiftPacket, 5, 0, (struct sockaddr*)&hostInputAddr, sizeof(hostInputAddr));
+
+                        std::cout << "\n[GEAR SHIFT] Network struggling! Dropping video quality to 3 Mbps.\n\n";
+                    }
+                    else if (networkIsPerfect && g_currentBitrate == BITRATE_LOW) {
+                        // SHIFT UP! (Coast is clear)
+                        g_currentBitrate = BITRATE_HIGH;
+                        g_bitrateCooldown = 5;
+
+                        char shiftPacket[5];
+                        shiftPacket[0] = 0x0A;
+                        memcpy(shiftPacket + 1, &g_currentBitrate, 4);
+                        sendto(inputSocket, shiftPacket, 5, 0, (struct sockaddr*)&hostInputAddr, sizeof(hostInputAddr));
+
+                        std::cout << "\n[GEAR SHIFT] Network recovered! Restoring video quality to 8 Mbps.\n\n";
+                    }
+                }
 
                 // 3. Fire the next Heartbeat
                 LARGE_INTEGER pingTime;
