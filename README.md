@@ -31,20 +31,3 @@ GameStream was built under the strict High-Tech Minimalist engineering doctrine:
 * **Absolute Mouse Positioning:** Custom logic to intercept and translate coordinates natively, eliminating standard remote-desktop cursor drift and resolution mismatch bugs.
 * **Zero-Trust Tunnels:** All transmission data is securely encrypted over a Tailscale mesh network, preventing local snooping or unauthorized host access.
 * **Dynamic Resolution Adapting:** Instantly corrects host-to-client resolution scaling without requiring manual monitor adjustments.
-
----
-
-## 🚀 Deployment (Development)
-
-To initialize the GameStream infrastructure on your local nodes:
-
-### 1. Host Initialization
-The host machine requires an NVIDIA GPU with NVENC capabilities.
-```bash
-# Navigate to the Host directory
-cd gamestream-host
-
-# Ensure local dependencies are met (NVIDIA Drivers, Audio Virtualization)
-# Build and execute the host daemon
-./build_host.sh
-./gamestream_daemon --port 47989
